@@ -1,6 +1,18 @@
+"""VisageCNN desktop application — real-time facial expression recognition with
+session analytics, expression history logging, and CSV export.
+"""
+
+import warnings
+import os
+
+warnings.filterwarnings("ignore", message="SymbolDatabase.GetPrototype.*")
+warnings.filterwarnings("ignore", category=UserWarning, module="google.protobuf")
+os.environ["GLOG_minloglevel"] = "2"
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
+
 import cv2
 import tkinter as tk
-from tkinter import messagebox, ttk
+from tkinter import messagebox, ttk, filedialog
 from PIL import Image, ImageTk
 import sqlite3
 import numpy as np
@@ -9,144 +21,181 @@ import torch.nn.functional as F
 import mediapipe as mp
 from datetime import datetime
 import pytz
-import os
 import time
-from collections import deque
+from collections import deque, Counter
 import sys
 import json
 import csv
-from tkinter import filedialog
-from collections import Counter
 import pickle
 
-# Import from package
-sys.path.append(os.path.dirname(os.path.abspath(__file__)))
-from ..config import Config
-from ..models.enhanced_model import EnhancedModelUtils, create_enhanced_model
-from ..core.face_processor import EnhancedFaceMeshProcessor
-from ..data.processor import AdvancedEmotionDataset
+sys.path.insert(0, str(__file__))
 
-# Global variables
-pytorch_model = None
-inference_engine = None
+from ..config import Config
+from ..models.hybrid_model import create_hybrid_model
+
 ist = pytz.timezone('Asia/Kolkata')
+
+prediction_history: deque = deque(maxlen=10)
+fps_counter: deque = deque(maxlen=30)
+
 camera = None
-last_frame_time = 0
-prediction_history = deque(maxlen=10)
+last_frame_time = 0.0
 show_landmarks = False
 dark_mode = False
-fps_counter = deque(maxlen=30)
+
 session_stats = {
     'total_frames': 0,
-    'emotions_detected': {emotion: 0 for emotion in Config.EMOTION_CLASSES}
+    'emotions_detected': {emotion: 0 for emotion in Config.EMOTION_CLASSES},
 }
 
-class EnhancedPyTorchInference:
-    """PyTorch inference engine for VisageCNN"""
+inference_engine = None
+
+
+class HybridInferenceEngine:
+    """Inference engine that wraps HybridEmotionNet for single-frame prediction.
+
+    Handles model loading, MediaPipe face mesh initialisation, coordinate
+    extraction and normalisation, face crop preparation, and model inference.
+    """
 
     def __init__(self):
-        self.pytorch_model = None
-        self.face_processor = EnhancedFaceMeshProcessor()
-        self.scaler = None
         self.device = Config.DEVICE
-        self.load_model()
-        self.load_scaler()
+        self.model = None
+        self.face_mesh = None
+        self.scaler = None
+        self.img_mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
+        self.img_std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        self.use_amp = Config.MIXED_PRECISION and torch.cuda.is_available()
+        self._load_model()
+        self._init_face_mesh()
+        self._load_scaler()
 
-    def load_model(self):
-        """Load PyTorch model"""
+    def _load_model(self):
+        """Load HybridEmotionNet weights from the default checkpoint path."""
+        model_path = Config.MODELS_PATH / "weights" / "hybrid_best_model.pth"
         try:
-            model_path = Config.MODELS_PATH / "enhanced_best_model.pth"
+            self.model = create_hybrid_model(pretrained_cnn=False)
             if model_path.exists():
-                self.pytorch_model, checkpoint = EnhancedModelUtils.load_enhanced_model(
-                    model_path, self.device
-                )
-                self.pytorch_model.eval()
-            else:
-                self.pytorch_model = create_enhanced_model()
-                self.pytorch_model.eval()
-        except Exception as e:
+                checkpoint = torch.load(model_path, map_location=self.device, weights_only=False)
+                self.model.load_state_dict(checkpoint['model_state_dict'])
+            self.model.eval()
+        except Exception:
+            self.model = None
+
+    def _init_face_mesh(self):
+        """Initialise the MediaPipe FaceMesh processor."""
+        mp_face_mesh = mp.solutions.face_mesh
+        self.face_mesh = mp_face_mesh.FaceMesh(
+            static_image_mode=False,
+            max_num_faces=1,
+            refine_landmarks=True,
+            min_detection_confidence=0.5,
+            min_tracking_confidence=0.5,
+        )
+
+    def _load_scaler(self):
+        """Load the RobustScaler fitted during training, if available."""
+        scaler_path = Config.MODELS_PATH / "scalers" / "hybrid_coordinate_scaler.pkl"
+        if scaler_path.exists():
             try:
-                self.pytorch_model = create_enhanced_model()
-                self.pytorch_model.eval()
-            except Exception as e2:
-                self.pytorch_model = None
-
-    def load_scaler(self):
-        """Load coordinate scaler"""
-        try:
-            scaler_path = Config.MODELS_PATH / "enhanced_coordinate_scaler.pkl"
-            if scaler_path.exists():
                 with open(scaler_path, 'rb') as f:
-                    scaler_data = pickle.load(f)
-                    if isinstance(scaler_data, dict):
-                        self.scaler = scaler_data.get('scaler')
-                    else:
-                        self.scaler = scaler_data
-            else:
+                    self.scaler = pickle.load(f)
+            except Exception:
                 self.scaler = None
-        except Exception as e:
-            self.scaler = None
 
-    def predict(self, frame):
-        """Prediction method using PyTorch architecture"""
-        if self.pytorch_model is None:
+    def predict(self, frame: np.ndarray):
+        """Run hybrid emotion prediction on a single RGB frame.
+
+        Args:
+            frame: RGB image array (as produced by cv2.cvtColor BGR→RGB).
+
+        Returns:
+            Tuple of (top2, all_predictions) where top2 is a list of
+            (emotion, confidence) pairs for the top-2 classes, and
+            all_predictions is a float32 numpy array of length 7.
+            Returns (None, None) when no face is detected or the model
+            is not loaded.
+        """
+        if self.model is None:
             return None, None
 
         try:
-            coordinates = self.face_processor.extract_coordinates_from_frame_enhanced(frame)
+            h, w = frame.shape[:2]
+            results = self.face_mesh.process(frame)
 
-            if coordinates is None:
+            if not results.multi_face_landmarks:
                 return None, None
 
-            normalized_coords = self.face_processor.normalize_coordinates_enhanced(coordinates)
+            landmarks = results.multi_face_landmarks[0]
 
-            if normalized_coords is None:
+            xs = [lm.x * w for lm in landmarks.landmark]
+            ys = [lm.y * h for lm in landmarks.landmark]
+            x_min, x_max = int(min(xs)), int(max(xs))
+            y_min, y_max = int(min(ys)), int(max(ys))
+
+            if (x_max - x_min) < 30 or (y_max - y_min) < 30:
                 return None, None
 
-            # Ensure consistent dimensions (1434 features)
-            if len(normalized_coords) != Config.COORDINATE_DIM:
-                if len(normalized_coords) > Config.COORDINATE_DIM:
-                    normalized_coords = normalized_coords[:Config.COORDINATE_DIM]
-                else:
-                    padded = np.zeros(Config.COORDINATE_DIM, dtype=np.float32)
-                    padded[:len(normalized_coords)] = normalized_coords
-                    normalized_coords = padded
+            coords = []
+            for lm in landmarks.landmark:
+                coords.extend([lm.x * w, lm.y * h, lm.z * w])
+            coords = np.array(coords, dtype=np.float32)
 
-            # Apply scaling if available
+            coords_3d = coords.reshape(-1, 3)
+            half_w, half_h = w / 2.0, h / 2.0
+            coords_3d[:, 0] = (coords_3d[:, 0] - half_w) / half_w
+            coords_3d[:, 1] = (coords_3d[:, 1] - half_h) / half_h
+            coords_3d[:, 2] = coords_3d[:, 2] * 0.1
+            coords = coords_3d.flatten()
+
+            if len(coords) < Config.COORDINATE_DIM:
+                padded = np.zeros(Config.COORDINATE_DIM, dtype=np.float32)
+                padded[:len(coords)] = coords
+                coords = padded
+
             if self.scaler is not None:
                 try:
-                    normalized_coords = self.scaler.transform([normalized_coords])[0]
+                    coords = self.scaler.transform([coords])[0]
                 except Exception:
                     pass
 
-            # Model prediction
+            face_w = x_max - x_min
+            face_h = y_max - y_min
+            pad_w = int(face_w * 0.2)
+            pad_h = int(face_h * 0.2)
+            crop_x1 = max(0, x_min - pad_w)
+            crop_x2 = min(w, x_max + pad_w)
+            crop_y1 = max(0, y_min - pad_h)
+            crop_y2 = min(h, y_max + pad_h)
+
+            face_crop = frame[crop_y1:crop_y2, crop_x1:crop_x2]
+            face_crop = cv2.resize(face_crop, (Config.FACE_CROP_SIZE, Config.FACE_CROP_SIZE))
+            face_crop = face_crop.astype(np.float32) / 255.0
+            face_crop = (face_crop - self.img_mean) / self.img_std
+            face_crop = face_crop.transpose(2, 0, 1)
+
+            coord_tensor = torch.tensor(coords, dtype=torch.float32).unsqueeze(0).to(self.device)
+            crop_tensor = torch.tensor(face_crop, dtype=torch.float32).unsqueeze(0).to(self.device)
+
             with torch.no_grad():
-                tensor_coords = torch.tensor(normalized_coords, dtype=torch.float32).unsqueeze(0)
-                tensor_coords = tensor_coords.to(self.device)
-
-                if Config.MIXED_PRECISION:
+                if self.use_amp:
                     with torch.amp.autocast('cuda'):
-                        outputs = self.pytorch_model(tensor_coords)
+                        output = self.model(coord_tensor, crop_tensor)
                 else:
-                    outputs = self.pytorch_model(tensor_coords)
+                    output = self.model(coord_tensor, crop_tensor)
 
-                probabilities = torch.nn.functional.softmax(outputs, dim=1)
-                predictions = probabilities.cpu().numpy()[0]
+            probs = F.softmax(output, dim=1).cpu().numpy()[0]
+            top2_idx = np.argsort(probs)[-2:][::-1]
+            top2 = [(Config.EMOTION_CLASSES[i], float(probs[i])) for i in top2_idx]
 
-                # Get top 2 predictions
-                top2_idx = np.argsort(predictions)[-2:][::-1]
-                top2 = [(Config.EMOTION_CLASSES[i], float(predictions[i])) for i in top2_idx]
-
-                return top2, predictions
+            return top2, probs
 
         except Exception:
             return None, None
 
-# Initialize PyTorch inference
-pytorch_inference = EnhancedPyTorchInference()
 
 def initialize_db():
-    """Initialize SQLite database for storing predictions"""
+    """Create the expressions and sessions tables if they do not exist."""
     conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
     cursor = conn.cursor()
 
@@ -184,30 +233,43 @@ def initialize_db():
     conn.commit()
     conn.close()
 
-def insert_expression(expression, confidence, all_predictions, session_id="current", inference_time=0.0):
-    """Insert prediction into database"""
+
+def insert_expression(expression, confidence, all_predictions, session_id="current",
+                      inference_time=0.0):
+    """Insert a single prediction record into the expressions table.
+
+    Args:
+        expression: Predicted emotion label.
+        confidence: Confidence score (0–1).
+        all_predictions: Array of probabilities for all 7 classes.
+        session_id: Identifier for the current session.
+        inference_time: Wall-clock inference time in seconds.
+    """
     conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
     cursor = conn.cursor()
     current_time = datetime.now(ist).strftime('%Y-%m-%d %H:%M:%S')
 
-    predictions_json = ','.join([f"{Config.EMOTION_CLASSES[i]}:{pred:.4f}"
-                                for i, pred in enumerate(all_predictions)])
+    predictions_json = ','.join([
+        f"{Config.EMOTION_CLASSES[i]}:{pred:.4f}"
+        for i, pred in enumerate(all_predictions)
+    ])
 
-    gpu_info = f"GPU {Config.CUDA_MEMORY_FRACTION*100:.0f}%" if torch.cuda.is_available() else "CPU"
-    model_arch = f"Model-{Config.HIDDEN_SIZE}D-{Config.NUM_LAYERS}L-{Config.NUM_HEADS}H"
+    gpu_info = "GPU" if torch.cuda.is_available() else "CPU"
+    model_arch = "HybridEmotionNet (EfficientNet-B0 + MLP)"
 
     cursor.execute('''
         INSERT INTO expressions (expression, confidence, all_predictions, timestamp, session_id,
                                model_version, inference_time, model_architecture, batch_size, gpu_memory)
         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     ''', (expression, confidence, predictions_json, current_time, session_id,
-          "pytorch_v2.0", inference_time, model_arch, Config.BATCH_SIZE, gpu_info))
+          "hybrid_v3.0", inference_time, model_arch, Config.BATCH_SIZE, gpu_info))
 
     conn.commit()
     conn.close()
 
+
 def view_data():
-    """Display stored predictions with analytics"""
+    """Open the analytics dashboard window."""
     conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
     cursor = conn.cursor()
     cursor.execute('SELECT * FROM expressions ORDER BY timestamp DESC LIMIT 1000')
@@ -215,45 +277,35 @@ def view_data():
     conn.close()
 
     view_window = tk.Toplevel(window)
-    view_window.title("VisageCNN Expression Data Analytics")
+    view_window.title("VisageCNN Expression Analytics")
     view_window.geometry("1200x800")
     apply_theme(view_window)
 
-    # Create notebook for tabs
     notebook = ttk.Notebook(view_window)
     notebook.pack(fill='both', expand=True, padx=10, pady=10)
 
-    # Data tab
     data_frame = ttk.Frame(notebook)
     notebook.add(data_frame, text="Recent Data")
 
-    # Create treeview
     tree_frame = tk.Frame(data_frame)
     tree_frame.pack(expand=True, fill='both', padx=5, pady=5)
 
-    columns = ('ID', 'Expression', 'Confidence', 'Timestamp', 'Model', 'Architecture', 'Inference Time', 'GPU')
+    columns = ('ID', 'Expression', 'Confidence', 'Timestamp', 'Model', 'Architecture',
+               'Inference Time', 'GPU')
     tree = ttk.Treeview(tree_frame, columns=columns, show='headings')
 
-    # Define headings and column widths
-    tree.heading('ID', text='ID')
-    tree.heading('Expression', text='Expression')
-    tree.heading('Confidence', text='Confidence (%)')
-    tree.heading('Timestamp', text='Timestamp')
-    tree.heading('Model', text='Model Version')
-    tree.heading('Architecture', text='Architecture')
-    tree.heading('Inference Time', text='Inference (ms)')
-    tree.heading('GPU', text='GPU Usage')
+    for col in columns:
+        tree.heading(col, text=col)
 
     tree.column('ID', width=50, anchor='center')
     tree.column('Expression', width=100, anchor='center')
     tree.column('Confidence', width=100, anchor='center')
     tree.column('Timestamp', width=150, anchor='center')
     tree.column('Model', width=120, anchor='center')
-    tree.column('Architecture', width=150, anchor='center')
+    tree.column('Architecture', width=200, anchor='center')
     tree.column('Inference Time', width=100, anchor='center')
-    tree.column('GPU', width=100, anchor='center')
+    tree.column('GPU', width=80, anchor='center')
 
-    # Add scrollbars
     v_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.VERTICAL, command=tree.yview)
     h_scrollbar = ttk.Scrollbar(tree_frame, orient=tk.HORIZONTAL, command=tree.xview)
     tree.configure(yscrollcommand=v_scrollbar.set, xscrollcommand=h_scrollbar.set)
@@ -262,54 +314,51 @@ def view_data():
     h_scrollbar.pack(side=tk.BOTTOM, fill=tk.X)
     tree.pack(expand=True, fill='both')
 
-    # Add data to treeview
     for row in rows:
         display_row = list(row)
         if len(display_row) > 2:
             display_row[2] = f"{float(display_row[2]):.2%}"
-        if len(display_row) > 7:
-            display_row[7] = f"{float(display_row[7])*1000:.1f}" if display_row[7] else "N/A"
-
+        if len(display_row) > 7 and display_row[7]:
+            display_row[7] = f"{float(display_row[7]) * 1000:.1f}ms"
         while len(display_row) < len(columns):
             display_row.append("N/A")
-
         tree.insert('', tk.END, values=display_row[:len(columns)])
 
-    # Statistics tab
     stats_frame = ttk.Frame(notebook)
     notebook.add(stats_frame, text="Analytics")
-
     if rows:
         create_statistics(stats_frame, rows)
 
-    # Button frame
     button_frame = tk.Frame(view_window)
     button_frame.pack(fill='x', padx=10, pady=5)
 
-    ttk.Button(button_frame, text="Export CSV", command=lambda: export_data()).pack(side='left', padx=5)
-    ttk.Button(button_frame, text="Generate Report", command=lambda: generate_report()).pack(side='left', padx=5)
-    ttk.Button(button_frame, text="Model Info", command=lambda: show_model_info()).pack(side='left', padx=5)
-    ttk.Button(button_frame, text="Clear Data", command=lambda: clear_data(view_window)).pack(side='left', padx=5)
+    ttk.Button(button_frame, text="Export CSV", command=export_data).pack(side='left', padx=5)
+    ttk.Button(button_frame, text="Trends", command=show_emotion_trends).pack(side='left', padx=5)
+    ttk.Button(button_frame, text="Model Info", command=show_model_info).pack(side='left', padx=5)
+    ttk.Button(button_frame, text="Clear Data",
+               command=lambda: clear_data(view_window)).pack(side='left', padx=5)
     ttk.Button(button_frame, text="Close", command=view_window.destroy).pack(side='right', padx=5)
 
+
 def create_statistics(parent, rows):
-    """Create statistics display"""
+    """Render analytics text into a scrollable text widget.
+
+    Args:
+        parent: Tkinter parent widget.
+        rows: List of expression table rows.
+    """
     text_frame = tk.Frame(parent)
     text_frame.pack(fill='both', expand=True, padx=10, pady=10)
 
     stats_text = tk.Text(text_frame, wrap=tk.WORD, padx=10, pady=10)
     scrollbar = ttk.Scrollbar(text_frame, orient=tk.VERTICAL, command=stats_text.yview)
     stats_text.configure(yscrollcommand=scrollbar.set)
-
     scrollbar.pack(side=tk.RIGHT, fill=tk.Y)
     stats_text.pack(fill='both', expand=True)
 
-    # Calculate statistics
     emotions_count = {}
     confidence_by_emotion = {}
     inference_times = []
-    model_versions = {}
-    architectures = {}
 
     for row in rows:
         emotion = row[1]
@@ -318,76 +367,50 @@ def create_statistics(parent, rows):
         if len(row) > 7 and row[7]:
             inference_times.append(float(row[7]))
 
-        if len(row) > 6 and row[6]:
-            model_versions[row[6]] = model_versions.get(row[6], 0) + 1
-
-        if len(row) > 8 and row[8]:
-            architectures[row[8]] = architectures.get(row[8], 0) + 1
-
         emotions_count[emotion] = emotions_count.get(emotion, 0) + 1
+        confidence_by_emotion.setdefault(emotion, []).append(confidence)
 
-        if emotion not in confidence_by_emotion:
-            confidence_by_emotion[emotion] = []
-        confidence_by_emotion[emotion].append(confidence)
+    content = "VISAGECNN ANALYTICS\n"
+    content += "=" * 70 + "\n\n"
+    content += f"Total Predictions:  {len(rows)}\n"
+    content += f"Model:              HybridEmotionNet (EfficientNet-B0 + MLP)\n"
+    content += f"Device:             {'GPU' if torch.cuda.is_available() else 'CPU'}\n\n"
 
-    # Generate report
-    stats_content = f"VISAGECNN ANALYTICS REPORT\n"
-    stats_content += "=" * 70 + "\n\n"
-
-    stats_content += f"MODEL OVERVIEW\n"
-    stats_content += f"Total Predictions: {len(rows)}\n"
-    stats_content += f"Framework: PyTorch\n"
-    stats_content += f"Architecture: {Config.HIDDEN_SIZE}D Hidden, {Config.NUM_LAYERS} Layers, {Config.NUM_HEADS} Heads\n"
-    stats_content += f"Batch Size: {Config.BATCH_SIZE}\n"
-    stats_content += f"Mixed Precision: {Config.MIXED_PRECISION}\n\n"
-
-    stats_content += f"EMOTION DISTRIBUTION\n"
-    stats_content += "-" * 50 + "\n"
+    content += "EMOTION DISTRIBUTION\n" + "-" * 50 + "\n"
     for emotion, count in sorted(emotions_count.items(), key=lambda x: x[1], reverse=True):
-        percentage = (count / len(rows)) * 100
-        if emotion in confidence_by_emotion:
-            avg_confidence = np.mean(confidence_by_emotion[emotion]) * 100
-            stats_content += f"{emotion.capitalize():12} {count:4} ({percentage:5.1f}%) | Avg Conf: {avg_confidence:5.1f}%\n"
+        pct = (count / len(rows)) * 100
+        avg_conf = np.mean(confidence_by_emotion[emotion]) * 100
+        content += f"{emotion:<12} {count:4} ({pct:5.1f}%)  avg confidence: {avg_conf:.1f}%\n"
 
-    stats_content += f"\nCONFIDENCE ANALYSIS\n"
-    stats_content += "-" * 50 + "\n"
-    all_confidences = [float(row[2]) for row in rows]
-    stats_content += f"Overall Avg Confidence: {np.mean(all_confidences)*100:.1f}%\n"
-    stats_content += f"Confidence Std Dev: {np.std(all_confidences)*100:.1f}%\n"
-    stats_content += f"High Confidence (>80%): {sum(1 for c in all_confidences if c > 0.8)}/{len(all_confidences)}\n"
-    stats_content += f"Excellent Confidence (>90%): {sum(1 for c in all_confidences if c > 0.9)}/{len(all_confidences)}\n"
+    content += "\nCONFIDENCE ANALYSIS\n" + "-" * 50 + "\n"
+    all_confidences = [float(r[2]) for r in rows]
+    content += f"Mean confidence:    {np.mean(all_confidences) * 100:.1f}%\n"
+    content += f"Std deviation:      {np.std(all_confidences) * 100:.1f}%\n"
+    content += f"High (>80%):        {sum(1 for c in all_confidences if c > 0.8)}/{len(all_confidences)}\n"
 
-    # Performance analysis
     if inference_times:
-        stats_content += f"\nPERFORMANCE ANALYSIS\n"
-        stats_content += "-" * 50 + "\n"
-        stats_content += f"Avg Inference Time: {np.mean(inference_times)*1000:.1f}ms\n"
-        stats_content += f"Min Inference Time: {np.min(inference_times)*1000:.1f}ms\n"
-        stats_content += f"Max Inference Time: {np.max(inference_times)*1000:.1f}ms\n"
-        stats_content += f"Std Dev: {np.std(inference_times)*1000:.1f}ms\n"
-
+        content += "\nPERFORMANCE\n" + "-" * 50 + "\n"
+        content += f"Avg inference:      {np.mean(inference_times) * 1000:.1f} ms\n"
+        content += f"Min / Max:          {np.min(inference_times) * 1000:.1f} / {np.max(inference_times) * 1000:.1f} ms\n"
         avg_fps = 1.0 / np.mean(inference_times) if np.mean(inference_times) > 0 else 0
-        stats_content += f"Average FPS: {avg_fps:.1f}\n"
+        content += f"Average FPS:        {avg_fps:.1f}\n"
 
-    # Top performing emotions
-    stats_content += f"\nTOP PERFORMING EMOTIONS\n"
-    stats_content += "-" * 50 + "\n"
-    emotion_performance = [(emotion, np.mean(confidences))
-                          for emotion, confidences in confidence_by_emotion.items()]
-    emotion_performance.sort(key=lambda x: x[1], reverse=True)
+    content += "\nPER-CLASS CONFIDENCE\n" + "-" * 50 + "\n"
+    for emotion, confs in sorted(confidence_by_emotion.items(),
+                                  key=lambda x: np.mean(x[1]), reverse=True):
+        avg = np.mean(confs)
+        grade = "high" if avg > 0.8 else "medium" if avg > 0.6 else "low"
+        content += f"[{grade}] {emotion:<12} {avg * 100:.1f}%\n"
 
-    for emotion, avg_conf in emotion_performance:
-        grade = "[HIGH]" if avg_conf > 0.8 else "[MED]" if avg_conf > 0.6 else "[LOW]"
-        stats_content += f"{grade} {emotion.capitalize():12} {avg_conf*100:5.1f}% average confidence\n"
-
-    stats_text.insert(tk.END, stats_content)
+    stats_text.insert(tk.END, content)
     stats_text.config(state=tk.DISABLED)
 
+
 def show_model_info():
-    """Show detailed model information"""
+    """Open a window showing HybridEmotionNet architecture and system details."""
     info_window = tk.Toplevel(window)
     info_window.title("Model Information")
-    info_window.geometry("600x700")
+    info_window.geometry("600x600")
     apply_theme(info_window)
 
     text_widget = tk.Text(info_window, wrap=tk.WORD, padx=10, pady=10)
@@ -395,98 +418,80 @@ def show_model_info():
 
     device_info = Config.get_device_info()
 
-    info_content = f"VISAGECNN MODEL INFORMATION\n"
-    info_content += "=" * 60 + "\n\n"
+    content = "VISAGECNN — HYBRID MODEL INFORMATION\n" + "=" * 60 + "\n\n"
 
-    info_content += f"MODEL ARCHITECTURE\n"
-    info_content += f"Framework: PyTorch\n"
-    info_content += f"Model Type: CoordinateEmotionNet\n"
-    info_content += f"Input Features: {Config.FEATURE_SIZE} (1434 coordinates)\n"
-    info_content += f"Hidden Size: {Config.HIDDEN_SIZE}\n"
-    info_content += f"Number of Layers: {Config.NUM_LAYERS}\n"
-    info_content += f"Attention Heads: {Config.NUM_HEADS}\n"
-    info_content += f"Dropout Rate: {Config.DROPOUT_RATE}\n"
-    info_content += f"Output Classes: {Config.NUM_CLASSES}\n\n"
+    content += "ARCHITECTURE\n"
+    content += "Model:              HybridEmotionNet\n"
+    content += "CNN Branch:         EfficientNet-B0 (blocks 0-2 frozen)\n"
+    content += "Coordinate Branch:  MLP (1434 → 512 → 384 → 256)\n"
+    content += "Fusion:             Cross-attention + MLP (512 → 128 → 7)\n"
+    content += f"Input Landmarks:    {Config.NUM_LANDMARKS} × 3D = {Config.COORDINATE_DIM} features\n"
+    content += f"Face Crop Size:     {Config.FACE_CROP_SIZE} × {Config.FACE_CROP_SIZE}\n"
+    content += f"Output Classes:     {Config.NUM_CLASSES}\n\n"
 
-    info_content += f"MODEL FEATURES\n"
-    info_content += f"Multi-Head Attention: Yes\n"
-    info_content += f"Geometric Features: Yes ({Config.GEOMETRIC_FEATURE_DIM}D)\n"
-    info_content += f"Expert Networks: Yes ({Config.NUM_EXPERTS} experts)\n"
-    info_content += f"Residual Connections: Yes\n"
-    info_content += f"Layer Normalization: Yes\n"
-    info_content += f"3D Coordinates: Yes\n\n"
+    content += "SYSTEM\n"
+    if device_info['device'] == 'cuda':
+        content += f"GPU:                {device_info['device_name']}\n"
+        content += f"Total VRAM:         {device_info.get('memory_total', 'N/A')} GB\n"
+    else:
+        content += f"Device:             CPU ({device_info.get('cores', 'N/A')} cores)\n"
+    content += f"Mixed Precision:    {Config.MIXED_PRECISION}\n"
+    content += f"Batch Size:         {Config.BATCH_SIZE}\n\n"
 
-    info_content += f"SYSTEM OPTIMIZATION\n"
-    info_content += f"GPU: {device_info.get('device_name', 'N/A')}\n"
-    info_content += f"Total Memory: {device_info.get('memory_total', 'N/A')} GB\n"
-    info_content += f"Memory Fraction: {Config.CUDA_MEMORY_FRACTION*100:.0f}%\n"
-    info_content += f"Mixed Precision: {Config.MIXED_PRECISION}\n"
-    info_content += f"Batch Size: {Config.BATCH_SIZE}\n"
-    info_content += f"Gradient Accumulation: {Config.GRADIENT_ACCUMULATION_STEPS}\n\n"
+    content += "MODEL STATUS\n"
+    model_status = "Loaded" if inference_engine and inference_engine.model else "Not loaded"
+    scaler_status = "Available" if inference_engine and inference_engine.scaler else "Not available"
+    content += f"Model weights:      {model_status}\n"
+    content += f"Coordinate scaler:  {scaler_status}\n"
+    content += f"Device:             {Config.DEVICE}\n"
 
-    info_content += f"TRAINING CONFIGURATION\n"
-    info_content += f"Learning Rate: {Config.BASE_LEARNING_RATE}\n"
-    info_content += f"Weight Decay: {Config.WEIGHT_DECAY}\n"
-    info_content += f"Focal Loss Alpha: {Config.FOCAL_LOSS_ALPHA}\n"
-    info_content += f"Focal Loss Gamma: {Config.FOCAL_LOSS_GAMMA}\n"
-    info_content += f"Mixup Alpha: {Config.MIXUP_ALPHA}\n\n"
-
-    info_content += f"FACE PROCESSING\n"
-    info_content += f"MediaPipe Complexity: {Config.FACE_MESH_COMPLEXITY}\n"
-    info_content += f"Landmarks: {Config.NUM_LANDMARKS}\n"
-    info_content += f"Coordinate Features: {Config.COORDINATE_FEATURES}\n"
-    info_content += f"Face Confidence Threshold: {Config.FACE_CONFIDENCE_THRESHOLD}\n"
-    info_content += f"Coordinate Smoothing: {Config.USE_COORDINATE_SMOOTHING}\n\n"
-
-    info_content += f"MODEL STATUS\n"
-    model_status = "Loaded" if pytorch_inference.pytorch_model is not None else "Not Loaded"
-    scaler_status = "Available" if pytorch_inference.scaler is not None else "Not Available"
-    info_content += f"Model: {model_status}\n"
-    info_content += f"Scaler: {scaler_status}\n"
-    info_content += f"Device: {pytorch_inference.device}\n"
-
-    if pytorch_inference.pytorch_model is not None:
+    if inference_engine and inference_engine.model:
         try:
-            total_params = sum(p.numel() for p in pytorch_inference.pytorch_model.parameters())
-            trainable_params = sum(p.numel() for p in pytorch_inference.pytorch_model.parameters() if p.requires_grad)
-            info_content += f"Total Parameters: {total_params:,}\n"
-            info_content += f"Trainable Parameters: {trainable_params:,}\n"
-        except:
-            info_content += f"Parameter count: Unable to calculate\n"
+            total = sum(p.numel() for p in inference_engine.model.parameters())
+            trainable = sum(p.numel() for p in inference_engine.model.parameters()
+                            if p.requires_grad)
+            content += f"Total parameters:   {total:,}\n"
+            content += f"Trainable params:   {trainable:,}\n"
+        except Exception:
+            pass
 
-    text_widget.insert(tk.END, info_content)
+    text_widget.insert(tk.END, content)
     text_widget.config(state=tk.DISABLED)
-
     ttk.Button(info_window, text="Close", command=info_window.destroy).pack(pady=10)
 
+
 def export_data():
-    """Export data to CSV"""
+    """Export all expression records to a user-selected CSV file."""
     try:
         filename = filedialog.asksaveasfilename(
             defaultextension=".csv",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")]
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
         )
+        if not filename:
+            return
 
-        if filename:
-            conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
-            cursor = conn.cursor()
-            cursor.execute('SELECT * FROM expressions ORDER BY timestamp DESC')
-            rows = cursor.fetchall()
-            conn.close()
+        conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
+        cursor = conn.cursor()
+        cursor.execute('SELECT * FROM expressions ORDER BY timestamp DESC')
+        rows = cursor.fetchall()
+        conn.close()
 
-            with open(filename, 'w', newline='', encoding='utf-8') as csvfile:
-                writer = csv.writer(csvfile)
-                writer.writerow(['ID', 'Expression', 'Confidence', 'All_Predictions', 'Timestamp',
-                               'Session', 'Model_Version', 'Inference_Time', 'Architecture',
-                               'Batch_Size', 'GPU_Memory'])
-                writer.writerows(rows)
+        with open(filename, 'w', newline='', encoding='utf-8') as f:
+            writer = csv.writer(f)
+            writer.writerow([
+                'ID', 'Expression', 'Confidence', 'All_Predictions', 'Timestamp',
+                'Session', 'Model_Version', 'Inference_Time', 'Architecture',
+                'Batch_Size', 'GPU_Memory',
+            ])
+            writer.writerows(rows)
 
-            messagebox.showinfo("Success", f"Data exported to {filename}")
+        messagebox.showinfo("Export Complete", f"Data exported to:\n{filename}")
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to export data: {str(e)}")
+        messagebox.showerror("Export Failed", str(e))
+
 
 def generate_report():
-    """Generate comprehensive report"""
+    """Open a comprehensive analytics window for all stored predictions."""
     try:
         conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
         cursor = conn.cursor()
@@ -495,465 +500,361 @@ def generate_report():
         conn.close()
 
         if not rows:
-            messagebox.showinfo("Info", "No data available for report generation")
+            messagebox.showinfo("No Data", "No predictions recorded yet.")
             return
 
         report_window = tk.Toplevel(window)
-        report_window.title("Comprehensive Analytics Report")
+        report_window.title("Analytics Report")
         report_window.geometry("900x700")
         apply_theme(report_window)
-
         create_statistics(report_window, rows)
 
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to generate report: {str(e)}")
+        messagebox.showerror("Error", str(e))
+
 
 def clear_data(parent_window):
-    """Clear all stored data"""
-    if messagebox.askyesno("Confirm Data Deletion",
-                          "Are you sure you want to delete ALL stored data?\n\nThis action cannot be undone!",
-                          parent=parent_window):
-        try:
-            conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM expressions')
-            cursor.execute('DELETE FROM sessions')
-            conn.commit()
-            conn.close()
-            messagebox.showinfo("Success", "All data cleared successfully", parent=parent_window)
-            parent_window.destroy()
-        except Exception as e:
-            messagebox.showerror("Error", f"Failed to clear data: {str(e)}", parent=parent_window)
+    """Delete all stored expression and session records after user confirmation.
 
-def predict_expression(image):
-    """Expression prediction using PyTorch model"""
+    Args:
+        parent_window: Parent window for the confirmation dialog.
+    """
+    if not messagebox.askyesno(
+        "Confirm", "Delete ALL stored data? This cannot be undone.",
+        parent=parent_window,
+    ):
+        return
     try:
-        start_time = time.time()
-        top2, all_predictions = pytorch_inference.predict(image)
-        inference_time = time.time() - start_time
+        conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
+        cursor = conn.cursor()
+        cursor.execute('DELETE FROM expressions')
+        cursor.execute('DELETE FROM sessions')
+        conn.commit()
+        conn.close()
+        messagebox.showinfo("Done", "All data cleared.", parent=parent_window)
+        parent_window.destroy()
+    except Exception as e:
+        messagebox.showerror("Error", str(e), parent=parent_window)
+
+
+def predict_expression(image: np.ndarray):
+    """Run inference and return smoothed top-2 predictions.
+
+    Args:
+        image: RGB frame array.
+
+    Returns:
+        Tuple of (top2 list, all_predictions array, inference_time seconds).
+    """
+    try:
+        start = time.time()
+        top2, all_predictions = inference_engine.predict(image)
+        inference_time = time.time() - start
 
         if top2 is None:
             return [], [], inference_time
 
-        # Apply smoothing
         if all_predictions is not None:
             all_predictions = smooth_predictions(all_predictions)
             top2_idx = np.argsort(all_predictions)[-2:][::-1]
             top2 = [(Config.EMOTION_CLASSES[i], float(all_predictions[i])) for i in top2_idx]
 
-        # Confidence filtering
-        confidence_threshold = 0.25
-        filtered_top2 = [(emotion, conf) for emotion, conf in top2 if conf >= confidence_threshold]
+        threshold = 0.25
+        filtered = [(e, c) for e, c in top2 if c >= threshold]
+        if not filtered:
+            filtered = [top2[0]] if top2 else []
 
-        if not filtered_top2:
-            filtered_top2 = [top2[0]] if top2 else []
-
-        return filtered_top2, all_predictions, inference_time
+        return filtered, all_predictions, inference_time
 
     except Exception:
         return [], [], 0.0
 
-def smooth_predictions(predictions):
-    """Prediction smoothing with stability"""
+
+def smooth_predictions(predictions: np.ndarray) -> np.ndarray:
+    """Apply exponential-weighted averaging over the recent prediction history.
+
+    Args:
+        predictions: Raw softmax probability array of length 7.
+
+    Returns:
+        Smoothed probability array.
+    """
     prediction_history.append(predictions)
 
     if len(prediction_history) > 1:
         weights = np.exp(np.linspace(-2, 0, len(prediction_history)))
-        weights = weights / weights.sum()
-
-        smoothed = np.zeros_like(predictions)
-        for i, pred in enumerate(prediction_history):
-            smoothed += pred * weights[i]
-
+        weights /= weights.sum()
+        smoothed = sum(p * w for p, w in zip(prediction_history, weights))
         return smoothed
 
     return predictions
 
-def calculate_fps():
-    """Calculate FPS with accuracy"""
-    current_time = time.time()
-    fps_counter.append(current_time)
 
+def calculate_fps() -> float:
+    """Compute current frames-per-second from the rolling timestamp buffer.
+
+    Returns:
+        Estimated FPS, or 0 if insufficient data.
+    """
+    fps_counter.append(time.time())
     if len(fps_counter) > 1:
-        time_diff = fps_counter[-1] - fps_counter[0]
-        if time_diff > 0:
-            return (len(fps_counter) - 1) / time_diff
+        elapsed = fps_counter[-1] - fps_counter[0]
+        if elapsed > 0:
+            return (len(fps_counter) - 1) / elapsed
+    return 0.0
 
-    return 0
 
 def update_session_stats():
-    """Update session statistics"""
+    """Refresh the session statistics label at the bottom of the camera view."""
     if hasattr(window, 'stats_label'):
-        total_frames = session_stats['total_frames']
-        if total_frames > 0:
-            dominant_emotion = max(session_stats['emotions_detected'],
-                                 key=session_stats['emotions_detected'].get)
-            dominant_count = session_stats['emotions_detected'][dominant_emotion]
-            dominant_percentage = (dominant_count / total_frames) * 100
-
-            stats_text = (f"Frames: {total_frames} | PyTorch Model | "
-                         f"GPU Available | Dominant: {dominant_emotion.capitalize()} ({dominant_percentage:.1f}%)")
+        total = session_stats['total_frames']
+        if total > 0:
+            dominant = max(session_stats['emotions_detected'],
+                           key=session_stats['emotions_detected'].get)
+            pct = session_stats['emotions_detected'][dominant] / total * 100
+            text = f"Frames: {total}  |  Dominant: {dominant} ({pct:.1f}%)"
         else:
-            stats_text = f"Frames: 0 | PyTorch Model | GPU Available | Dominant: None"
+            text = "Frames: 0  |  Dominant: –"
+        window.stats_label.config(text=text)
 
-        window.stats_label.config(text=stats_text)
 
 def show_camera():
-    """Camera display with predictions"""
+    """Read one webcam frame, run inference, render overlay, and schedule next call."""
     global camera, last_frame_time
 
     if camera is None or not camera.isOpened():
-        messagebox.showerror("Error", "Camera is not open")
+        messagebox.showerror("Error", "Camera is not open.")
         return
 
     now = time.time()
-    fps_limit = 30
-    if now - last_frame_time < 1.0 / fps_limit:
+    if now - last_frame_time < 1.0 / 30:
         window.after(1, show_camera)
         return
-
     last_frame_time = now
 
     ret, frame = camera.read()
-    if ret:
-        frame = cv2.flip(frame, 1)
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if not ret:
+        camera_label.after(33, show_camera)
+        return
 
-        # Show landmarks if enabled
-        if show_landmarks:
-            frame_rgb = draw_landmarks(frame_rgb)
+    frame = cv2.flip(frame, 1)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
 
-        # Prediction
-        top2, all_predictions, inference_time = predict_expression(frame_rgb)
+    if show_landmarks:
+        frame_rgb = draw_landmarks(frame_rgb)
 
-        if top2:
-            # Update session stats
-            session_stats['total_frames'] += 1
-            max_emotion = top2[0][0]
-            session_stats['emotions_detected'][max_emotion] += 1
+    top2, all_predictions, inference_time = predict_expression(frame_rgb)
 
-            # Calculate FPS
-            current_fps = calculate_fps()
+    if top2:
+        session_stats['total_frames'] += 1
+        session_stats['emotions_detected'][top2[0][0]] += 1
 
-            # Overlay drawing
-            overlay = frame_rgb.copy()
-            cv2.rectangle(overlay, (5, 5), (550, 180), (0, 0, 0), -1)
-            cv2.addWeighted(overlay, 0.7, frame_rgb, 0.3, 0, frame_rgb)
+        current_fps = calculate_fps()
 
-            # Draw predictions
-            for i, (emotion, confidence) in enumerate(top2):
-                color = (0, 255, 0) if i == 0 else (255, 255, 0)
-                confidence_text = f"{emotion.capitalize()}: {confidence:.1%}"
+        overlay = frame_rgb.copy()
+        cv2.rectangle(overlay, (5, 5), (560, 185), (0, 0, 0), -1)
+        cv2.addWeighted(overlay, 0.7, frame_rgb, 0.3, 0, frame_rgb)
 
-                # Confidence indicator
-                if confidence >= 0.9:
-                    indicator = "Excellent"
-                elif confidence >= 0.8:
-                    indicator = "Very Good"
-                elif confidence >= 0.6:
-                    indicator = "Good"
-                elif confidence >= 0.4:
-                    indicator = "Fair"
-                else:
-                    indicator = "Poor"
+        for i, (emotion, confidence) in enumerate(top2):
+            color = (0, 255, 0) if i == 0 else (255, 255, 0)
+            grade = (
+                "Excellent" if confidence >= 0.9 else
+                "Very Good" if confidence >= 0.8 else
+                "Good" if confidence >= 0.6 else
+                "Fair" if confidence >= 0.4 else
+                "Poor"
+            )
+            cv2.putText(frame_rgb, f"{i + 1}. {emotion}: {confidence:.1%}",
+                        (10, 30 + i * 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            cv2.putText(frame_rgb, f"   {grade}",
+                        (10, 50 + i * 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
-                cv2.putText(frame_rgb, f"{i+1}. {confidence_text}",
-                           (10, 30 + i * 35), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
-                cv2.putText(frame_rgb, f"   {indicator}",
-                           (10, 50 + i * 35), cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
+        cv2.putText(frame_rgb, "HybridEmotionNet",
+                    (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        cv2.putText(frame_rgb, f"FPS: {current_fps:.1f}  |  {inference_time * 1000:.1f}ms",
+                    (10, 145), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
 
-            # Framework indicator
-            cv2.putText(frame_rgb, "PyTorch Model",
-                       (10, 120), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        for i, (_, confidence) in enumerate(top2):
+            bar_w = int(confidence * 250)
+            color = (0, 255, 0) if i == 0 else (255, 255, 0)
+            cv2.rectangle(frame_rgb, (310, 30 + i * 35), (310 + bar_w, 45 + i * 35), color, -1)
 
-            cv2.putText(frame_rgb, f"GPU | {Config.HIDDEN_SIZE}D-{Config.NUM_LAYERS}L",
-                       (10, 140), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    img = ImageTk.PhotoImage(Image.fromarray(frame_rgb))
+    camera_label.config(image=img)
+    camera_label.image = img
 
-            # Performance metrics
-            cv2.putText(frame_rgb, f"FPS: {current_fps:.1f}", (10, 160),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-            cv2.putText(frame_rgb, f"Inference: {inference_time*1000:.1f}ms", (150, 160),
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-
-            # Confidence bars
-            for i, (_, confidence) in enumerate(top2):
-                bar_width = int(confidence * 250)
-                color = (0, 255, 0) if i == 0 else (255, 255, 0)
-                cv2.rectangle(frame_rgb, (300, 30 + i * 35), (300 + bar_width, 45 + i * 35), color, -1)
-                cv2.putText(frame_rgb, f"{confidence:.1%}", (560, 42 + i * 35),
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
-
-        # Convert and display
-        img = Image.fromarray(frame_rgb)
-        img = ImageTk.PhotoImage(img)
-        camera_label.config(image=img)
-        camera_label.image = img
-
-        update_session_stats()
-
+    update_session_stats()
     camera_label.after(33, show_camera)
 
-def draw_landmarks(frame):
-    """Draw facial landmarks on frame"""
-    try:
-        coordinates = pytorch_inference.face_processor.extract_coordinates_from_frame_enhanced(frame)
-        if coordinates is not None:
-            # Reshape coordinates to (num_landmarks, 3)
-            coords_3d = coordinates.reshape(-1, 3)
 
-            # Draw landmarks
-            for i, (x, y, z) in enumerate(coords_3d):
-                cv2.circle(frame, (int(x), int(y)), 1, (0, 255, 0), -1)
+def draw_landmarks(frame: np.ndarray) -> np.ndarray:
+    """Draw MediaPipe facial landmark points onto the frame.
+
+    Args:
+        frame: RGB image array.
+
+    Returns:
+        Frame with landmark dots rendered.
+    """
+    try:
+        results = inference_engine.face_mesh.process(frame)
+        if results.multi_face_landmarks:
+            h, w = frame.shape[:2]
+            for lm in results.multi_face_landmarks[0].landmark:
+                cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 1, (0, 255, 0), -1)
     except Exception:
         pass
-
     return frame
 
+
 def capture_image_frame():
-    """Capture frame with detailed analysis"""
+    """Capture the current webcam frame, run inference, and open the analysis window."""
     global camera
 
-    if camera is not None and camera.isOpened():
-        ret, frame = camera.read()
-        if ret:
-            frame = cv2.flip(frame, 1)
-            frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    if camera is None or not camera.isOpened():
+        messagebox.showerror("Error", "Camera not available.")
+        return
 
-            top2, all_predictions, inference_time = predict_expression(frame_rgb)
+    ret, frame = camera.read()
+    if not ret:
+        messagebox.showerror("Error", "Failed to capture frame.")
+        return
 
-            if top2:
-                insert_expression(top2[0][0], top2[0][1], all_predictions, inference_time=inference_time)
-                display_capture_analysis(frame_rgb, top2, all_predictions, inference_time)
-            else:
-                messagebox.showinfo("Info", "No confident predictions available")
-        else:
-            messagebox.showerror("Error", "Failed to capture frame")
+    frame = cv2.flip(frame, 1)
+    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+    top2, all_predictions, inference_time = predict_expression(frame_rgb)
+
+    if top2:
+        insert_expression(top2[0][0], top2[0][1], all_predictions, inference_time=inference_time)
+        display_capture_analysis(frame_rgb, top2, all_predictions, inference_time)
     else:
-        messagebox.showerror("Error", "Camera not available")
+        messagebox.showinfo("No Face", "No face detected in this frame.")
+
 
 def display_capture_analysis(frame, top2, predictions, inference_time):
-    """Display capture analysis"""
+    """Open a detailed analysis window for a captured frame.
+
+    Args:
+        frame: RGB image array of the captured frame.
+        top2: Top-2 (emotion, confidence) pairs.
+        predictions: Full probability array.
+        inference_time: Inference duration in seconds.
+    """
     result_window = tk.Toplevel(window)
     result_window.title("Expression Analysis")
     result_window.geometry("900x1000")
     apply_theme(result_window)
 
-    # Image frame
-    img_frame = tk.Frame(result_window)
-    img_frame.pack(fill=tk.X, padx=10, pady=10)
+    img = Image.fromarray(frame).resize((450, 350), Image.Resampling.LANCZOS)
+    img_tk = ImageTk.PhotoImage(img)
+    img_label = tk.Label(tk.Frame(result_window), image=img_tk)
+    img_label.image = img_tk
+    img_label.pack(padx=10, pady=10)
 
-    # Convert and display image
-    img = Image.fromarray(frame)
-    img = img.resize((450, 350), Image.Resampling.LANCZOS)
-    img = ImageTk.PhotoImage(img)
-    img_label = tk.Label(img_frame, image=img)
-    img_label.image = img
-    img_label.pack()
-
-    # Results frame
     result_frame = tk.Frame(result_window)
     result_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    # Model and performance indicators
     info_frame = tk.Frame(result_frame)
     info_frame.pack(fill='x', pady=5)
+    tk.Label(info_frame, text="HybridEmotionNet", font=('Helvetica', 12, 'bold')).pack(side='left')
+    tk.Label(info_frame, text="EfficientNet-B0 + MLP", font=('Helvetica', 10)).pack(side='left', padx=10)
+    tk.Label(info_frame, text=f"{inference_time * 1000:.1f}ms", font=('Helvetica', 10)).pack(side='right')
 
-    framework_label = tk.Label(info_frame, text="PyTorch Model",
-                              font=('Helvetica', 12, 'bold'))
-    framework_label.pack(side='left')
-
-    model_info = tk.Label(info_frame, text=f"{Config.HIDDEN_SIZE}D-{Config.NUM_LAYERS}L-{Config.NUM_HEADS}H",
-                         font=('Helvetica', 10))
-    model_info.pack(side='left', padx=10)
-
-    perf_label = tk.Label(info_frame, text=f"{inference_time*1000:.1f}ms | GPU",
-                         font=('Helvetica', 10))
-    perf_label.pack(side='right')
-
-    # Top predictions
     top_frame = tk.LabelFrame(result_frame, text="Top Predictions", padx=10, pady=10)
     top_frame.pack(fill='x', pady=5)
 
     for i, (emotion, confidence) in enumerate(top2):
-        pred_frame = tk.Frame(top_frame)
-        pred_frame.pack(fill='x', pady=3)
+        row = tk.Frame(top_frame)
+        row.pack(fill='x', pady=3)
+        tk.Label(row, text=f"#{i + 1}", font=('Helvetica', 14, 'bold'), width=3).pack(side='left')
+        tk.Label(row, text=emotion, font=('Helvetica', 12, 'bold'), width=12, anchor='w').pack(side='left')
+        color = 'green' if confidence > 0.8 else 'blue' if confidence > 0.6 else 'orange' if confidence > 0.4 else 'red'
+        grade = "Excellent" if confidence > 0.8 else "Very Good" if confidence > 0.6 else "Good" if confidence > 0.4 else "Uncertain"
+        tk.Label(row, text=f"{confidence:.2%}", font=('Helvetica', 12), fg=color, width=8).pack(side='left')
+        tk.Label(row, text=grade, font=('Helvetica', 10)).pack(side='left', padx=10)
 
-        # Rank and emotion
-        rank_label = tk.Label(pred_frame, text=f"#{i+1}", font=('Helvetica', 14, 'bold'), width=3)
-        rank_label.pack(side='left')
-
-        emotion_label = tk.Label(pred_frame, text=f"{emotion.capitalize()}",
-                                font=('Helvetica', 12, 'bold'), width=12, anchor='w')
-        emotion_label.pack(side='left')
-
-        # Confidence with color coding
-        if confidence > 0.8:
-            conf_color = 'green'
-            grade = "Excellent"
-        elif confidence > 0.6:
-            conf_color = 'blue'
-            grade = "Very Good"
-        elif confidence > 0.4:
-            conf_color = 'orange'
-            grade = "Good"
-        else:
-            conf_color = 'red'
-            grade = "Needs improvement"
-
-        conf_label = tk.Label(pred_frame, text=f"{confidence:.2%}",
-                             font=('Helvetica', 12), fg=conf_color, width=8)
-        conf_label.pack(side='left')
-
-        grade_label = tk.Label(pred_frame, text=grade, font=('Helvetica', 10))
-        grade_label.pack(side='left', padx=10)
-
-    # All emotions analysis
-    all_frame = tk.LabelFrame(result_frame, text="Complete Analysis (All 7 Emotions)",
-                             padx=10, pady=10)
+    all_frame = tk.LabelFrame(result_frame, text="All Emotions", padx=10, pady=10)
     all_frame.pack(fill='both', expand=True, pady=5)
 
-    # Create canvas for visualization
-    canvas_frame = tk.Frame(all_frame)
-    canvas_frame.pack(fill='both', expand=True)
-
-    canvas = tk.Canvas(canvas_frame, height=350, bg='white')
-    scrollbar_canvas = ttk.Scrollbar(canvas_frame, orient="vertical", command=canvas.yview)
-    scrollable_frame = ttk.Frame(canvas)
-
-    scrollable_frame.bind(
-        "<Configure>",
-        lambda e: canvas.configure(scrollregion=canvas.bbox("all"))
-    )
-
-    canvas.create_window((0, 0), window=scrollable_frame, anchor="nw")
-    canvas.configure(yscrollcommand=scrollbar_canvas.set)
-
-    # Emotion analysis
-    emotion_emojis = {
-        'happy': 'Happy', 'sad': 'Sad', 'angry': 'Angry', 'fear': 'Fear',
-        'surprised': 'Surprised', 'disgust': 'Disgust', 'neutral': 'Neutral'
-    }
+    canvas = tk.Canvas(all_frame, height=350, bg='white')
+    scrollbar = ttk.Scrollbar(all_frame, orient="vertical", command=canvas.yview)
+    scrollable = ttk.Frame(canvas)
+    scrollable.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+    canvas.create_window((0, 0), window=scrollable, anchor="nw")
+    canvas.configure(yscrollcommand=scrollbar.set)
 
     for i, emotion in enumerate(Config.EMOTION_CLASSES):
-        confidence = float(predictions[i])
-        emotion_frame = tk.Frame(scrollable_frame)
-        emotion_frame.pack(fill='x', pady=4, padx=5)
-
-        # Emotion name
-        label_text = emotion_emojis.get(emotion.lower(), emotion.capitalize())
-        tk.Label(emotion_frame, text=label_text,
-                width=15, anchor='w', font=('Helvetica', 11, 'bold')).pack(side='left')
-
-        # Progress bar
-        progress_frame = tk.Frame(emotion_frame)
-        progress_frame.pack(side='left', padx=10)
-        progress = ttk.Progressbar(progress_frame, length=250, value=confidence*100)
-        progress.pack(side='top')
-
-        # Percentage with color coding
-        if confidence > 0.8:
-            conf_color = 'green'
-        elif confidence > 0.6:
-            conf_color = 'blue'
-        elif confidence > 0.4:
-            conf_color = 'orange'
-        else:
-            conf_color = 'red'
-
-        tk.Label(emotion_frame, text=f"{confidence:.2%}",
-                width=8, fg=conf_color, font=('Helvetica', 11, 'bold')).pack(side='left', padx=5)
-
-        # Confidence level
-        if confidence >= 0.9:
-            level = "Excellent"
-        elif confidence >= 0.8:
-            level = "Very High"
-        elif confidence >= 0.6:
-            level = "High"
-        elif confidence >= 0.4:
-            level = "Medium"
-        elif confidence >= 0.2:
-            level = "Low"
-        else:
-            level = "Very Low"
-
-        tk.Label(emotion_frame, text=level, width=12,
-                font=('Helvetica', 10), fg='gray').pack(side='left')
+        conf = float(predictions[i])
+        row = tk.Frame(scrollable)
+        row.pack(fill='x', pady=4, padx=5)
+        tk.Label(row, text=emotion, width=15, anchor='w', font=('Helvetica', 11, 'bold')).pack(side='left')
+        ttk.Progressbar(row, length=250, value=conf * 100).pack(side='left', padx=10)
+        color = 'green' if conf > 0.8 else 'blue' if conf > 0.6 else 'orange' if conf > 0.4 else 'red'
+        tk.Label(row, text=f"{conf:.2%}", width=8, fg=color, font=('Helvetica', 11, 'bold')).pack(side='left', padx=5)
 
     canvas.pack(side="left", fill="both", expand=True)
-    scrollbar_canvas.pack(side="right", fill="y")
+    scrollbar.pack(side="right", fill="y")
 
-    # Button frame
     btn_frame = tk.Frame(result_window)
     btn_frame.pack(fill='x', padx=10, pady=10)
-
     ttk.Button(btn_frame, text="Save Analysis",
-              command=lambda: save_analysis(frame, predictions, inference_time)).pack(side='left', padx=5)
-    ttk.Button(btn_frame, text="View Trends",
-              command=lambda: show_emotion_trends()).pack(side='left', padx=5)
-    ttk.Button(btn_frame, text="Model Details",
-              command=lambda: show_model_info()).pack(side='left', padx=5)
-    ttk.Button(btn_frame, text="Close",
-              command=result_window.destroy).pack(side='right', padx=5)
+               command=lambda: save_analysis(predictions, inference_time)).pack(side='left', padx=5)
+    ttk.Button(btn_frame, text="Trends", command=show_emotion_trends).pack(side='left', padx=5)
+    ttk.Button(btn_frame, text="Model Info", command=show_model_info).pack(side='left', padx=5)
+    ttk.Button(btn_frame, text="Close", command=result_window.destroy).pack(side='right', padx=5)
 
-def save_analysis(frame, predictions, inference_time):
-    """Save analysis to file"""
+
+def save_analysis(predictions, inference_time):
+    """Prompt the user to save the current prediction analysis as JSON.
+
+    Args:
+        predictions: Full probability array.
+        inference_time: Inference duration in seconds.
+    """
     try:
         filename = filedialog.asksaveasfilename(
             defaultextension=".json",
-            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
         )
+        if not filename:
+            return
 
-        if filename:
-            analysis_data = {
-                'timestamp': datetime.now(ist).isoformat(),
-                'framework': 'PyTorch',
-                'model_version': 'pytorch_v2.0',
-                'model_architecture': {
-                    'hidden_size': Config.HIDDEN_SIZE,
-                    'num_layers': Config.NUM_LAYERS,
-                    'num_heads': Config.NUM_HEADS,
-                    'dropout_rate': Config.DROPOUT_RATE,
-                    'geometric_feature_dim': Config.GEOMETRIC_FEATURE_DIM,
-                    'expert_hidden_size': Config.EXPERT_HIDDEN_SIZE
-                },
-                'performance_metrics': {
-                    'inference_time_ms': inference_time * 1000,
-                    'batch_size': Config.BATCH_SIZE,
-                    'mixed_precision': Config.MIXED_PRECISION,
-                    'gpu_memory_fraction': Config.CUDA_MEMORY_FRACTION
-                },
-                'predictions': {emotion: float(predictions[i])
-                              for i, emotion in enumerate(Config.EMOTION_CLASSES)},
-                'top_emotion': Config.EMOTION_CLASSES[np.argmax(predictions)],
-                'confidence': float(np.max(predictions)),
-                'quality_metrics': {
-                    'entropy': float(-np.sum(predictions * np.log(predictions + 1e-10))),
-                    'avg_confidence': float(np.mean(predictions)),
-                    'max_confidence': float(np.max(predictions)),
-                    'confidence_spread': float(np.std(predictions)),
-                    'high_confidence_count': int(np.sum(predictions > 0.8))
-                }
-            }
+        data = {
+            'timestamp': datetime.now(ist).isoformat(),
+            'model': 'HybridEmotionNet',
+            'architecture': 'EfficientNet-B0 + MLP Coordinate Encoder + Cross-Attention Fusion',
+            'performance': {
+                'inference_time_ms': inference_time * 1000,
+                'device': str(Config.DEVICE),
+                'mixed_precision': Config.MIXED_PRECISION,
+            },
+            'predictions': {e: float(predictions[i]) for i, e in enumerate(Config.EMOTION_CLASSES)},
+            'top_emotion': Config.EMOTION_CLASSES[int(np.argmax(predictions))],
+            'confidence': float(np.max(predictions)),
+        }
 
-            with open(filename, 'w') as f:
-                json.dump(analysis_data, f, indent=2)
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
 
-            messagebox.showinfo("Success", f"Analysis saved to {filename}")
+        messagebox.showinfo("Saved", f"Analysis saved to:\n{filename}")
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to save analysis: {str(e)}")
+        messagebox.showerror("Save Failed", str(e))
+
 
 def show_emotion_trends():
-    """Show emotion trends analysis"""
+    """Open a window showing emotion distribution from the last 20 predictions."""
     try:
         conn = sqlite3.connect(str(Config.LOGS_PATH / "expressions.db"))
         cursor = conn.cursor()
-        cursor.execute('SELECT expression, timestamp, confidence FROM expressions ORDER BY timestamp DESC LIMIT 100')
-        recent_data = cursor.fetchall()
+        cursor.execute(
+            'SELECT expression, timestamp, confidence FROM expressions '
+            'ORDER BY timestamp DESC LIMIT 100'
+        )
+        recent = cursor.fetchall()
         conn.close()
 
-        if not recent_data:
-            messagebox.showinfo("Info", "No data available for trend analysis")
+        if not recent:
+            messagebox.showinfo("No Data", "No predictions recorded yet.")
             return
 
         trends_window = tk.Toplevel(window)
@@ -964,159 +865,129 @@ def show_emotion_trends():
         text_widget = tk.Text(trends_window, wrap=tk.WORD, padx=10, pady=10)
         text_widget.pack(fill='both', expand=True, padx=10, pady=10)
 
-        # Calculate trends
-        recent_emotions = [row[0] for row in recent_data[:20]]
-        recent_confidences = [float(row[2]) for row in recent_data[:20]]
-        emotion_counts = Counter(recent_emotions)
+        sample = recent[:20]
+        emotions = [r[0] for r in sample]
+        confidences = [float(r[2]) for r in sample]
+        counts = Counter(emotions)
 
-        trends_text = "EMOTION TRENDS (Last 20 Predictions)\n"
-        trends_text += f"Framework: PyTorch | Model: {Config.HIDDEN_SIZE}D-{Config.NUM_LAYERS}L-{Config.NUM_HEADS}H\n"
-        trends_text += "=" * 60 + "\n\n"
+        content = "EMOTION TRENDS (Last 20 Predictions)\n"
+        content += "=" * 60 + "\n\n"
+        content += "DISTRIBUTION\n"
+        for emotion, count in counts.most_common():
+            pct = count / len(emotions) * 100
+            avg = np.mean([float(r[2]) for r in sample if r[0] == emotion])
+            bar = "#" * int(pct / 3)
+            content += f"{emotion:<10} {bar:<20} {pct:5.1f}%  avg conf: {avg:.1%}\n"
 
-        trends_text += "EMOTION DISTRIBUTION\n"
-        for emotion, count in emotion_counts.most_common():
-            percentage = (count / len(recent_emotions)) * 100
-            emotion_confidences = [float(row[2]) for row in recent_data[:20] if row[0] == emotion]
-            avg_conf = np.mean(emotion_confidences) if emotion_confidences else 0
+        content += f"\nQUALITY\n"
+        content += f"Avg confidence:  {np.mean(confidences):.1%}\n"
+        content += f"High (>80%):     {sum(1 for c in confidences if c > 0.8)}/{len(confidences)}\n"
+        content += f"Std deviation:   {np.std(confidences):.1%}\n"
 
-            bar = "#" * int(percentage / 3)
-            trends_text += f"{emotion.capitalize():10} {bar:20} {percentage:5.1f}% (Avg: {avg_conf:.1%})\n"
-
-        trends_text += f"\nQUALITY METRICS\n"
-        trends_text += f"Average Confidence: {np.mean(recent_confidences):.1%}\n"
-        trends_text += f"High Confidence (>80%): {sum(1 for c in recent_confidences if c > 0.8)}/{len(recent_confidences)}\n"
-        trends_text += f"Confidence Std Dev: {np.std(recent_confidences):.1%}\n"
-
-        text_widget.insert(tk.END, trends_text)
+        text_widget.insert(tk.END, content)
         text_widget.config(state=tk.DISABLED)
 
     except Exception as e:
-        messagebox.showerror("Error", f"Failed to show trends: {str(e)}")
+        messagebox.showerror("Error", str(e))
 
-# Theme functions - FIXED
+
 def toggle_theme():
-    """Toggle between light and dark themes - FIXED"""
+    """Toggle between light and dark UI themes."""
     global dark_mode
     dark_mode = not dark_mode
     apply_theme(window)
     theme_btn.config(text="Light Mode" if dark_mode else "Dark Mode")
 
-def apply_theme(widget):
-    """Apply current theme to widget - FIXED"""
-    if dark_mode:
-        bg_color = '#2b2b2b'
-        fg_color = '#ffffff'
-    else:
-        bg_color = '#e0f7fa'
-        fg_color = '#000000'
 
+def apply_theme(widget):
+    """Recursively apply the current colour theme to a widget and its children.
+
+    Args:
+        widget: Tkinter widget to theme.
+    """
+    bg = '#2b2b2b' if dark_mode else '#e0f7fa'
+    fg = '#ffffff' if dark_mode else '#000000'
     try:
-        widget.configure(bg=bg_color)
+        widget.configure(bg=bg)
         for child in widget.winfo_children():
             if isinstance(child, (tk.Label, tk.Frame, tk.Text)):
                 try:
-                    child.configure(bg=bg_color, fg=fg_color)
-                except:
+                    child.configure(bg=bg, fg=fg)
+                except Exception:
                     pass
             apply_theme(child)
-    except:
+    except Exception:
         pass
 
-# Landmarks function - FIXED
+
 def toggle_landmarks():
-    """Toggle landmark display - FIXED"""
+    """Toggle facial landmark overlay on the camera feed."""
     global show_landmarks
     show_landmarks = not show_landmarks
     landmarks_btn.config(text="Hide Landmarks" if show_landmarks else "Show Landmarks")
 
+
 def show_help():
-    """Show help dialog"""
-    help_text = """
-VISAGECNN - PYTORCH EMOTION RECOGNITION
-
-FEATURES
-- PyTorch implementation with coordinate-based learning
-- Multi-head attention mechanism for better feature relationships
-- Geometric feature extraction from facial landmarks
-- Emotion-specific expert networks for specialized processing
-- 478 facial landmark analysis using MediaPipe (highest complexity)
-- Real-time prediction smoothing and confidence filtering
-- Session statistics with dominant emotion tracking
-- Comprehensive analytics dashboard with performance metrics
-
-CONTROLS
-- Access Camera: Start live emotion detection
-- Capture & Analyze: Detailed frame analysis with all 7 emotions
-- Show/Hide Landmarks: Toggle facial landmarks display
-- Analytics Dashboard: View comprehensive data analytics
-- Model Info: Detailed information about the architecture
-- Dark/Light Mode: Theme switching
-
-ANALYTICS
-- Real-time confidence scoring with quality indicators
-- Session statistics tracking with performance metrics
-- Emotion trend analysis over time with confidence tracking
-- Comprehensive reporting with inference time tracking
-- Data export capabilities (CSV format)
-- Model architecture performance analysis
-
-TIPS FOR BEST RESULTS
-- Ensure good lighting for better face detection
-- Keep face centered and at comfortable distance
-- Avoid rapid movements for stable predictions
-- Check confidence indicators for prediction quality
-- Use analytics to track emotion patterns and model performance
-
-TECHNICAL INFO
-- Framework: PyTorch Architecture
-- Model: CoordinateEmotionNet
-- Input Features: 1,434 (478 landmarks x 3 coordinates)
-- Hidden Dimensions: """ + str(Config.HIDDEN_SIZE) + """D
-- Transformer Layers: """ + str(Config.NUM_LAYERS) + """
-- Attention Heads: """ + str(Config.NUM_HEADS) + """
-- Real-time processing with prediction smoothing
-- MediaPipe integration with highest complexity (Level 2)
-- SQLite database for comprehensive data logging
-- GPU acceleration support
-
-PERFORMANCE
-- Target: 30 FPS real-time processing
-- Batch Size: """ + str(Config.BATCH_SIZE) + """
-- Mixed Precision: Enabled for efficiency
-- Memory Usage: """ + str(Config.CUDA_MEMORY_FRACTION*100) + """% GPU utilization
-- Inference time tracking and optimization
-- Memory efficient coordinate processing
-"""
-
+    """Open the help and usage guide window."""
     help_window = tk.Toplevel(window)
-    help_window.title("Help Guide - PyTorch VisageCNN")
-    help_window.geometry("800x700")
+    help_window.title("Help Guide")
+    help_window.geometry("800x650")
     apply_theme(help_window)
 
     text_widget = tk.Text(help_window, wrap=tk.WORD, padx=10, pady=10)
     text_widget.pack(fill='both', expand=True, padx=10, pady=10)
-    text_widget.insert(tk.END, help_text)
-    text_widget.config(state=tk.DISABLED)
 
+    content = (
+        "VISAGECNN — HYBRID EMOTION RECOGNITION\n\n"
+        "ARCHITECTURE\n"
+        "HybridEmotionNet combines two parallel feature streams:\n"
+        "  • EfficientNet-B0 CNN branch — extracts appearance cues from a 224×224 face crop\n"
+        "  • MLP Coordinate branch — encodes 478 3D MediaPipe landmarks (1,434 features)\n"
+        "Both streams are fused via cross-attention and a 3-layer MLP classifier.\n\n"
+        "CONTROLS\n"
+        "  Access Camera       Start live emotion detection\n"
+        "  Capture & Analyse   Detailed single-frame analysis with all 7 classes\n"
+        "  Show/Hide Landmarks Toggle MediaPipe landmark overlay\n"
+        "  Analytics Dashboard View prediction history and confidence statistics\n"
+        "  Model Info          Architecture and system details\n"
+        "  Dark/Light Mode     Switch UI colour theme\n\n"
+        "TIPS FOR BEST RESULTS\n"
+        "  • Ensure even, front-facing lighting\n"
+        "  • Keep face centred and at a comfortable distance\n"
+        "  • Avoid rapid head movements for more stable predictions\n"
+        "  • Check confidence scores — values below 35% are shown as Uncertain\n\n"
+        "TECHNICAL DETAILS\n"
+        f"  Backbone:           EfficientNet-B0 (ImageNet pre-trained, top-3 blocks frozen)\n"
+        f"  Landmark input:     {Config.COORDINATE_DIM} features ({Config.NUM_LANDMARKS} landmarks × 3)\n"
+        f"  Face crop size:     {Config.FACE_CROP_SIZE} × {Config.FACE_CROP_SIZE}\n"
+        f"  Device:             {Config.DEVICE}\n"
+        f"  Mixed precision:    {Config.MIXED_PRECISION}\n"
+        "  Storage:            SQLite (logs/expressions.db)\n"
+    )
+
+    text_widget.insert(tk.END, content)
+    text_widget.config(state=tk.DISABLED)
     ttk.Button(help_window, text="Close", command=help_window.destroy).pack(pady=10)
 
-# Camera functions
+
 def terminate_program():
-    """Cleanup and shutdown"""
+    """Release the camera and close the application."""
     global camera
     if camera is not None:
         camera.release()
     cv2.destroyAllWindows()
     window.destroy()
 
+
 def switch_to_screen2():
-    """Switch to camera screen"""
+    """Navigate to the camera view."""
     screen1_frame.grid_forget()
     screen2_frame.grid(row=0, column=0, sticky="nsew")
     update_session_stats()
 
+
 def switch_to_screen1():
-    """Switch to main menu"""
+    """Navigate back to the main menu and release the camera."""
     global camera
     if camera is not None:
         camera.release()
@@ -1124,202 +995,143 @@ def switch_to_screen1():
     screen2_frame.grid_forget()
     screen1_frame.grid(row=0, column=0, sticky="nsew")
 
+
 def open_camera():
-    """Open camera"""
+    """Try each camera index in turn and start the live feed on success."""
     global camera
     try:
-        for camera_index in [1, 2]:
-            camera = cv2.VideoCapture(camera_index)
+        for index in [0, 1, 2]:
+            camera = cv2.VideoCapture(index)
             if camera.isOpened():
                 camera.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
                 camera.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
                 camera.set(cv2.CAP_PROP_FPS, 30)
                 camera.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 break
-
-        if not camera.isOpened():
-            raise ValueError("No camera found")
+        else:
+            raise ValueError("No camera found.")
 
         show_camera()
         switch_to_screen2()
 
     except Exception as e:
-        messagebox.showerror("Error", f"Camera error: {str(e)}")
+        messagebox.showerror("Camera Error", str(e))
+
 
 def main():
-    """Main application function"""
+    """Initialise the database, build the inference engine, and start the GUI."""
     global window, camera_label, theme_btn, landmarks_btn
-    global screen1_frame, screen2_frame
+    global screen1_frame, screen2_frame, inference_engine
 
-    # Initialize database
     initialize_db()
+    inference_engine = HybridInferenceEngine()
 
-    # Create main window
     window = tk.Tk()
-    window.title("VisageCNN - PyTorch Expression Recognition")
+    window.title("VisageCNN — Hybrid Emotion Recognition")
     window.geometry("1000x750")
 
-    # Center window
     window.update_idletasks()
-    screen_width = window.winfo_screenwidth()
-    screen_height = window.winfo_screenheight()
-    x = (screen_width - 1000) // 2
-    y = (screen_height - 750) // 2
+    x = (window.winfo_screenwidth() - 1000) // 2
+    y = (window.winfo_screenheight() - 750) // 2
     window.geometry(f"1000x750+{x}+{y}")
 
-    # Configure styles
     style = ttk.Style()
     style.configure('TButton', font=('Helvetica', 11), padding=8)
     style.configure('TLabel', font=('Helvetica', 11))
 
-    # Configure grid
     window.grid_rowconfigure(0, weight=1)
     window.grid_columnconfigure(0, weight=1)
 
-    # Screen 1: Main Menu
     screen1_frame = tk.Frame(window, bg='#e0f7fa')
     screen1_frame.grid(row=0, column=0, sticky="nsew")
 
-    # Title
-    title_label = tk.Label(
-        screen1_frame,
-        text="VisageCNN",
-        font=('Helvetica', 26, 'bold'),
-        bg='#e0f7fa',
-        pady=15
-    )
-    title_label.pack(pady=20)
+    tk.Label(screen1_frame, text="VisageCNN",
+             font=('Helvetica', 26, 'bold'), bg='#e0f7fa', pady=15).pack(pady=20)
 
-    subtitle_label = tk.Label(
-        screen1_frame,
-        text="PyTorch Coordinate-Based Expression Recognition",
-        font=('Helvetica', 14),
-        bg='#e0f7fa'
-    )
-    subtitle_label.pack()
+    tk.Label(screen1_frame, text="Hybrid CNN + Landmark Emotion Recognition",
+             font=('Helvetica', 14), bg='#e0f7fa').pack()
 
-    # Model architecture info
-    arch_label = tk.Label(
-        screen1_frame,
-        text=f"Architecture: {Config.HIDDEN_SIZE}D Hidden | {Config.NUM_LAYERS} Layers | {Config.NUM_HEADS} Attention Heads",
-        font=('Helvetica', 10, 'italic'),
-        bg='#e0f7fa',
-        fg='#666666'
-    )
-    arch_label.pack(pady=5)
-
-    # Model status
-    model_status = "PyTorch Model Ready" if pytorch_inference.pytorch_model is not None else "PyTorch Model Not Found"
-    scaler_status = "Scaler Ready" if pytorch_inference.scaler is not None else "Scaler Not Found"
+    tk.Label(screen1_frame,
+             text="EfficientNet-B0 × MediaPipe FaceMesh (478 landmarks)",
+             font=('Helvetica', 10, 'italic'), bg='#e0f7fa', fg='#666666').pack(pady=5)
 
     status_frame = tk.Frame(screen1_frame, bg='#e0f7fa')
     status_frame.pack(pady=10)
 
-    model_label = tk.Label(
-        status_frame,
-        text=model_status,
-        font=('Helvetica', 10),
-        fg="green" if pytorch_inference.pytorch_model is not None else "red",
-        bg='#e0f7fa'
-    )
-    model_label.pack()
+    model_ok = inference_engine.model is not None
+    scaler_ok = inference_engine.scaler is not None
 
-    scaler_label = tk.Label(
-        status_frame,
-        text=scaler_status,
-        font=('Helvetica', 10),
-        fg="green" if pytorch_inference.scaler is not None else "orange",
-        bg='#e0f7fa'
-    )
-    scaler_label.pack()
+    tk.Label(status_frame,
+             text="Model: Ready" if model_ok else "Model: Not Found",
+             font=('Helvetica', 10),
+             fg='green' if model_ok else 'red',
+             bg='#e0f7fa').pack()
 
-    # GPU status
-    gpu_status = f"GPU Ready ({Config.CUDA_MEMORY_FRACTION*100:.0f}% utilization)" if torch.cuda.is_available() else "CPU Mode"
-    gpu_label = tk.Label(
-        status_frame,
-        text=gpu_status,
-        font=('Helvetica', 10),
-        fg="blue" if torch.cuda.is_available() else "orange",
-        bg='#e0f7fa'
-    )
-    gpu_label.pack()
+    tk.Label(status_frame,
+             text="Scaler: Ready" if scaler_ok else "Scaler: Not Found",
+             font=('Helvetica', 10),
+             fg='green' if scaler_ok else 'orange',
+             bg='#e0f7fa').pack()
 
-    # Main buttons
+    tk.Label(status_frame,
+             text=f"Device: {'GPU' if torch.cuda.is_available() else 'CPU'}",
+             font=('Helvetica', 10),
+             fg='blue' if torch.cuda.is_available() else 'orange',
+             bg='#e0f7fa').pack()
+
     button_frame = tk.Frame(screen1_frame, bg='#e0f7fa')
     button_frame.pack(pady=40)
 
-    access_camera_button = ttk.Button(button_frame, text="Access Camera", command=open_camera)
-    access_camera_button.pack(pady=15, ipadx=30)
+    ttk.Button(button_frame, text="Access Camera", command=open_camera).pack(pady=15, ipadx=30)
+    ttk.Button(button_frame, text="Analytics Dashboard", command=view_data).pack(pady=10, ipadx=30)
 
-    view_data_button = ttk.Button(button_frame, text="Analytics Dashboard", command=view_data)
-    view_data_button.pack(pady=10, ipadx=30)
-
-    # Secondary buttons
     secondary_frame = tk.Frame(screen1_frame, bg='#e0f7fa')
     secondary_frame.pack(pady=20)
 
     theme_btn = ttk.Button(secondary_frame, text="Dark Mode", command=toggle_theme)
     theme_btn.pack(side='left', padx=5)
 
-    model_info_btn = ttk.Button(secondary_frame, text="Model Info", command=show_model_info)
-    model_info_btn.pack(side='left', padx=5)
+    ttk.Button(secondary_frame, text="Model Info", command=show_model_info).pack(side='left', padx=5)
+    ttk.Button(secondary_frame, text="Help Guide", command=show_help).pack(side='left', padx=5)
 
-    help_btn = ttk.Button(secondary_frame, text="Help Guide", command=show_help)
-    help_btn.pack(side='left', padx=5)
+    ttk.Button(screen1_frame, text="Exit", command=terminate_program).pack(side=tk.BOTTOM, pady=20)
 
-    # Terminate button
-    terminate_button_screen1 = ttk.Button(screen1_frame, text="Exit Application", command=terminate_program)
-    terminate_button_screen1.pack(side=tk.BOTTOM, pady=20)
-
-    # Screen 2: Camera View
     screen2_frame = tk.Frame(window, bg='#e0f7fa')
 
-    # Camera display
-    camera_label = tk.Label(screen2_frame, bg='#000000', text="Camera Loading...",
-                           fg='white', font=('Helvetica', 16))
+    camera_label = tk.Label(screen2_frame, bg='#000000', text="Camera Loading…",
+                             fg='white', font=('Helvetica', 16))
     camera_label.pack(fill=tk.BOTH, expand=True, padx=10, pady=10)
 
-    # Control buttons
     control_frame = tk.Frame(screen2_frame, bg='#e0f7fa')
     control_frame.pack(fill=tk.X, pady=5)
 
-    # Left side controls
     left_controls = tk.Frame(control_frame, bg='#e0f7fa')
     left_controls.pack(side='left', padx=10)
 
-    capture_image_button = ttk.Button(left_controls, text="Capture & Analyze", command=capture_image_frame)
-    capture_image_button.pack(side='left', padx=5)
+    ttk.Button(left_controls, text="Capture & Analyse",
+               command=capture_image_frame).pack(side='left', padx=5)
 
     landmarks_btn = ttk.Button(left_controls, text="Show Landmarks", command=toggle_landmarks)
     landmarks_btn.pack(side='left', padx=5)
 
-    model_info_btn2 = ttk.Button(left_controls, text="Model Info", command=show_model_info)
-    model_info_btn2.pack(side='left', padx=5)
+    ttk.Button(left_controls, text="Model Info", command=show_model_info).pack(side='left', padx=5)
 
-    # Right side controls
     right_controls = tk.Frame(control_frame, bg='#e0f7fa')
     right_controls.pack(side='right', padx=10)
 
-    back_button = ttk.Button(right_controls, text="Main Menu", command=switch_to_screen1)
-    back_button.pack(side='right', padx=5)
+    ttk.Button(right_controls, text="Main Menu", command=switch_to_screen1).pack(side='right', padx=5)
 
-    # Status bar
-    status_frame = tk.Frame(screen2_frame, bg='#e0f7fa')
-    status_frame.pack(fill='x', pady=5)
+    status_bar = tk.Frame(screen2_frame, bg='#e0f7fa')
+    status_bar.pack(fill='x', pady=5)
 
-    window.stats_label = tk.Label(status_frame,
-                                 text="Session Stats: Frames: 0 | PyTorch Model | GPU Available | Dominant: None",
-                                 bg='#e0f7fa', font=('Helvetica', 10))
+    window.stats_label = tk.Label(status_bar, text="Frames: 0  |  Dominant: –",
+                                   bg='#e0f7fa', font=('Helvetica', 10))
     window.stats_label.pack()
 
-    # Start with Screen 1
     switch_to_screen1()
-
-    # Apply initial theme
     apply_theme(window)
-
-    # Start main loop
     window.mainloop()
+
 
 if __name__ == "__main__":
     main()

@@ -1,385 +1,351 @@
+"""Shared utilities for VisageCNN — logging, dataset analysis, model evaluation,
+visualisation, and experiment database management.
 """
-Enhanced Utilities for VisageCNN - RTX 3050 + Windows Optimized
-"""
+
 import torch
-import torch.nn as nn
 import numpy as np
 import matplotlib.pyplot as plt
 import seaborn as sns
-from sklearn.metrics import confusion_matrix, classification_report
+from sklearn.metrics import confusion_matrix
 from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 import logging
 from pathlib import Path
 import json
 from datetime import datetime
 import cv2
-from typing import Dict, List, Tuple, Optional
+from typing import Dict, List, Optional
 import sqlite3
 import pickle
 from .config import Config
 
-def setup_logging():
-    """Setup enhanced logging configuration with Windows Unicode support"""
+
+def setup_logging() -> logging.Logger:
+    """Initialise file and console logging with UTF-8 support.
+
+    Returns:
+        Root logger configured with both handlers.
+    """
     Config.LOGS_PATH.mkdir(parents=True, exist_ok=True)
-    
+
     log_file = Config.LOGS_PATH / f"visagecnn_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log"
-    
-    # Create handlers with UTF-8 encoding for Windows compatibility
+
     try:
         file_handler = logging.FileHandler(log_file, encoding='utf-8')
     except Exception:
-        # Fallback for systems without UTF-8 support
         file_handler = logging.FileHandler(log_file)
-    
+
     console_handler = logging.StreamHandler()
-    
-    # Set formatter
     formatter = logging.Formatter(Config.LOG_FORMAT)
     file_handler.setFormatter(formatter)
     console_handler.setFormatter(formatter)
-    
-    # Configure root logger
+
     logging.basicConfig(
         level=Config.LOG_LEVEL,
         handlers=[file_handler, console_handler],
-        force=True  # Override existing configuration
+        force=True,
     )
-    
-    logger = logging.getLogger(__name__)
-    logger.info("Enhanced logging system initialized")
-    return logger
+
+    return logging.getLogger(__name__)
+
 
 def create_project_structure():
-    """Create enhanced project directory structure"""
+    """Create all required project directories."""
     Config.create_directories()
-    
-    # Create additional enhanced directories
-    additional_dirs = [
+    additional = [
         Config.MODELS_PATH / "experiments",
         Config.LOGS_PATH / "tensorboard",
         Config.LOGS_PATH / "training",
-        Config.LOGS_PATH / "inference"
+        Config.LOGS_PATH / "inference",
     ]
-    
-    for directory in additional_dirs:
+    for directory in additional:
         directory.mkdir(parents=True, exist_ok=True)
-    
-    print("[OK] Enhanced project structure created successfully")
+
 
 def print_system_info():
-    """Print enhanced system information"""
+    """Print hardware and framework information to stdout."""
     device_info = Config.get_device_info()
-    
+
     print("\n" + "=" * 70)
-    print("ENHANCED SYSTEM INFORMATION")
+    print("SYSTEM INFORMATION")
     print("=" * 70)
-    
+
     if device_info['device'] == 'cuda':
-        print(f"GPU: {device_info['device_name']}")
-        print(f"Total Memory: {device_info['memory_total']} GB")
-        print(f"Allocated Memory: {device_info['memory_allocated']} GB")
-        print(f"Compute Capability: {device_info['compute_capability']}")
+        print(f"GPU:               {device_info['device_name']}")
+        print(f"Total VRAM:        {device_info['memory_total']} GB")
+        print(f"Allocated VRAM:    {device_info['memory_allocated']} GB")
+        print(f"Compute:           SM {device_info['compute_capability']}.x")
     else:
-        print(f"CPU Cores: {device_info['cores']}")
-    
-    print(f"PyTorch Version: {torch.__version__}")
-    print(f"CUDA Available: {torch.cuda.is_available()}")
+        print(f"CPU Cores:         {device_info['cores']}")
+
+    print(f"PyTorch:           {torch.__version__}")
+    print(f"CUDA Available:    {torch.cuda.is_available()}")
     if torch.cuda.is_available():
-        print(f"CUDA Version: {torch.version.cuda}")
-    
+        print(f"CUDA Version:      {torch.version.cuda}")
+
     print("=" * 70 + "\n")
 
+
 class DatasetAnalyzer:
-    """Enhanced dataset analysis utilities"""
-    
+    """Utilities for analysing emotion dataset distribution and balance."""
+
     @staticmethod
     def analyze_dataset_distribution(dataset_path: Path) -> Dict:
-        """Analyze enhanced dataset distribution with proper file detection"""
-        distribution = {}
-        total_samples = 0
-        
-        # Common image file extensions (case-insensitive)
+        """Count images per emotion class and compute per-class percentages.
+
+        Args:
+            dataset_path: Path to a directory containing one subdirectory per class.
+
+        Returns:
+            Dictionary with keys 'distribution', 'percentages', 'total_samples',
+            and 'num_classes'.
+        """
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff', '.tif', '.webp', '.gif'}
-        
-        print(f"[INFO] Scanning dataset path: {dataset_path}")
-        
-        # Check if dataset path exists
+        distribution = {emotion: 0 for emotion in Config.EMOTION_CLASSES}
+        total_samples = 0
+
         if not dataset_path.exists():
-            print(f"[ERROR] Dataset path does not exist: {dataset_path}")
             return {
-                'distribution': {},
-                'percentages': {},
+                'distribution': distribution,
+                'percentages': {e: 0.0 for e in Config.EMOTION_CLASSES},
                 'total_samples': 0,
-                'num_classes': 0
+                'num_classes': 0,
             }
-        
-        # Initialize distribution for all emotion classes
-        for emotion in Config.EMOTION_CLASSES:
-            distribution[emotion] = 0
-        
-        # Scan each emotion directory
+
         for emotion_dir in dataset_path.iterdir():
-            if emotion_dir.is_dir():
-                emotion_name = emotion_dir.name.lower()
-                
-                # Check if this is a valid emotion directory
-                if emotion_name in [e.lower() for e in Config.EMOTION_CLASSES]:
-                    # Find the correct case-sensitive emotion name
-                    correct_emotion_name = None
-                    for emotion in Config.EMOTION_CLASSES:
-                        if emotion.lower() == emotion_name:
-                            correct_emotion_name = emotion
-                            break
-                    
-                    print(f"  [INFO] Checking {emotion_dir.name} directory...")
-                    
-                    # Count image files with proper extensions
-                    image_files = []
-                    
-                    # Check all files in the directory
-                    for file_path in emotion_dir.iterdir():
-                        if file_path.is_file():
-                            file_ext = file_path.suffix.lower()
-                            if file_ext in image_extensions:
-                                image_files.append(file_path)
-                    
-                    count = len(image_files)
-                    if correct_emotion_name:
-                        distribution[correct_emotion_name] = count
-                        total_samples += count
-                    
-                    print(f"    [OK] Found {count} images in {emotion_dir.name}")
-                    
-                    # Debug: Show first few files found
-                    if count > 0:
-                        sample_files = [f.name for f in image_files[:3]]
-                        print(f"    [FILES] Sample files: {sample_files}")
-                    elif count == 0:
-                        # List all files to help debug
-                        all_files = list(emotion_dir.iterdir())
-                        if all_files:
-                            print(f"    [WARN] No images found, but directory contains {len(all_files)} files:")
-                            for i, f in enumerate(all_files[:5]):  # Show first 5 files
-                                print(f"      - {f.name} (extension: {f.suffix})")
-                            if len(all_files) > 5:
-                                print(f"      ... and {len(all_files) - 5} more files")
-                        else:
-                            print(f"    [WARN] Directory is empty")
-                else:
-                    print(f"  [SKIP] Skipping unknown directory: {emotion_dir.name}")
-        
-        # Calculate percentages (avoid division by zero)
-        if total_samples > 0:
-            percentages = {emotion: (count/total_samples)*100 
-                          for emotion, count in distribution.items()}
-        else:
-            percentages = {emotion: 0.0 for emotion in Config.EMOTION_CLASSES}
-        
-        print(f"\n[SUMMARY] Dataset analysis complete:")
-        print(f"  Total samples found: {total_samples}")
-        print(f"  Classes with data: {len([k for k, v in distribution.items() if v > 0])}")
-        
+            if not emotion_dir.is_dir():
+                continue
+
+            matched = next(
+                (e for e in Config.EMOTION_CLASSES if e.lower() == emotion_dir.name.lower()),
+                None,
+            )
+            if matched is None:
+                continue
+
+            count = sum(
+                1 for f in emotion_dir.iterdir()
+                if f.is_file() and f.suffix.lower() in image_extensions
+            )
+            distribution[matched] = count
+            total_samples += count
+
+        percentages = (
+            {e: (c / total_samples) * 100 for e, c in distribution.items()}
+            if total_samples > 0
+            else {e: 0.0 for e in Config.EMOTION_CLASSES}
+        )
+
         return {
             'distribution': distribution,
             'percentages': percentages,
             'total_samples': total_samples,
-            'num_classes': len([k for k, v in distribution.items() if v > 0])
+            'num_classes': sum(1 for v in distribution.values() if v > 0),
         }
-    
+
     @staticmethod
-    def plot_enhanced_distribution(analysis_result: Dict, save_path: Optional[Path] = None):
-        """Plot enhanced dataset distribution"""
+    def plot_distribution(analysis_result: Dict, save_path: Optional[Path] = None):
+        """Plot per-class sample counts and percentage breakdown.
+
+        Args:
+            analysis_result: Output of :meth:`analyze_dataset_distribution`.
+            save_path: Optional path to save the figure as a PNG.
+        """
         if analysis_result['total_samples'] == 0:
-            print("[WARN] Cannot plot distribution - no data found")
             return
-        
-        plt.figure(figsize=(12, 8))
-        
-        # Create subplots
-        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
-        
-        # Filter out emotions with zero samples for cleaner plots
-        non_zero_emotions = {k: v for k, v in analysis_result['distribution'].items() if v > 0}
-        
-        if not non_zero_emotions:
-            print("[WARN] No emotions with data to plot")
+
+        non_zero = {k: v for k, v in analysis_result['distribution'].items() if v > 0}
+        if not non_zero:
             return
-        
-        emotions = list(non_zero_emotions.keys())
-        counts = list(non_zero_emotions.values())
+
+        emotions = list(non_zero.keys())
+        counts = list(non_zero.values())
         colors = plt.cm.Set3(np.linspace(0, 1, len(emotions)))
-        
-        # Bar plot
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(15, 6))
+
         bars = ax1.bar(emotions, counts, color=colors)
-        ax1.set_title('Dataset Distribution - Sample Counts', fontsize=14, fontweight='bold')
-        ax1.set_xlabel('Emotions')
-        ax1.set_ylabel('Sample Count')
+        ax1.set_title('Sample Counts per Class', fontsize=14, fontweight='bold')
+        ax1.set_xlabel('Emotion')
+        ax1.set_ylabel('Count')
         ax1.tick_params(axis='x', rotation=45)
-        
-        # Add value labels on bars
         for bar in bars:
-            height = bar.get_height()
-            ax1.text(bar.get_x() + bar.get_width()/2., height,
-                    f'{int(height)}',
-                    ha='center', va='bottom')
-        
-        # Pie chart
-        percentages = [analysis_result['percentages'][emotion] for emotion in emotions]
-        ax2.pie(percentages, labels=emotions, autopct='%1.1f%%', 
-                colors=colors, startangle=90)
-        ax2.set_title('Dataset Distribution - Percentages', fontsize=14, fontweight='bold')
-        
+            ax1.text(
+                bar.get_x() + bar.get_width() / 2, bar.get_height(),
+                str(int(bar.get_height())), ha='center', va='bottom',
+            )
+
+        percentages = [analysis_result['percentages'][e] for e in emotions]
+        ax2.pie(percentages, labels=emotions, autopct='%1.1f%%', colors=colors, startangle=90)
+        ax2.set_title('Class Distribution (%)', fontsize=14, fontweight='bold')
+
         plt.tight_layout()
-        
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
         plt.show()
 
+
 class ModelEvaluator:
-    """Enhanced model evaluation utilities"""
-    
+    """Utilities for evaluating a trained model on a DataLoader."""
+
     @staticmethod
-    def evaluate_enhanced_model(model, data_loader, device=Config.DEVICE):
-        """Comprehensive enhanced model evaluation"""
+    def evaluate(model, data_loader, device=Config.DEVICE) -> Dict:
+        """Run model inference over an entire DataLoader and collect predictions.
+
+        Args:
+            model: Trained PyTorch model.
+            data_loader: DataLoader yielding (inputs, targets) batches.
+            device: Target device for inference.
+
+        Returns:
+            Dictionary with keys 'predictions', 'targets', and 'probabilities'.
+        """
         model.eval()
-        all_predictions = []
-        all_targets = []
-        all_probabilities = []
-        
+        all_predictions, all_targets, all_probabilities = [], [], []
+
         with torch.no_grad():
             for data, targets in data_loader:
                 data, targets = data.to(device), targets.to(device)
                 outputs = model(data)
                 probabilities = torch.nn.functional.softmax(outputs, dim=1)
                 _, predicted = torch.max(outputs, 1)
-                
                 all_predictions.extend(predicted.cpu().numpy())
                 all_targets.extend(targets.cpu().numpy())
                 all_probabilities.extend(probabilities.cpu().numpy())
-        
+
         return {
             'predictions': np.array(all_predictions),
             'targets': np.array(all_targets),
-            'probabilities': np.array(all_probabilities)
+            'probabilities': np.array(all_probabilities),
         }
-    
+
     @staticmethod
-    def calculate_enhanced_metrics(predictions, targets):
-        """Calculate enhanced evaluation metrics"""
+    def calculate_metrics(predictions, targets) -> Dict:
+        """Compute accuracy, precision, recall, F1, and per-class breakdowns.
+
+        Args:
+            predictions: Array of predicted class indices.
+            targets: Array of ground-truth class indices.
+
+        Returns:
+            Dictionary with overall and per-class metrics.
+        """
         accuracy = accuracy_score(targets, predictions)
-        precision, recall, f1, support = precision_recall_fscore_support(targets, predictions, average=None)
-        
-        # Per-class metrics
-        per_class_metrics = {}
+        precision, recall, f1, support = precision_recall_fscore_support(
+            targets, predictions, average=None
+        )
+
+        per_class = {}
         for i, emotion in enumerate(Config.EMOTION_CLASSES):
-            per_class_metrics[emotion] = {
-                'precision': precision[i] if i < len(precision) else 0,
-                'recall': recall[i] if i < len(recall) else 0,
-                'f1_score': f1[i] if i < len(f1) else 0,
-                'support': support[i] if i < len(support) else 0
+            per_class[emotion] = {
+                'precision': float(precision[i]) if i < len(precision) else 0.0,
+                'recall': float(recall[i]) if i < len(recall) else 0.0,
+                'f1_score': float(f1[i]) if i < len(f1) else 0.0,
+                'support': int(support[i]) if i < len(support) else 0,
             }
-        
-        # Average metrics
-        avg_precision = np.mean(precision)
-        avg_recall = np.mean(recall)
-        avg_f1 = np.mean(f1)
-        
+
         return {
             'accuracy': accuracy,
-            'avg_precision': avg_precision,
-            'avg_recall': avg_recall,
-            'avg_f1_score': avg_f1,
-            'per_class_metrics': per_class_metrics
+            'avg_precision': float(np.mean(precision)),
+            'avg_recall': float(np.mean(recall)),
+            'avg_f1_score': float(np.mean(f1)),
+            'per_class_metrics': per_class,
         }
-    
+
     @staticmethod
-    def plot_enhanced_confusion_matrix(targets, predictions, save_path: Optional[Path] = None):
-        """Plot enhanced confusion matrix"""
+    def plot_confusion_matrix(targets, predictions, save_path: Optional[Path] = None):
+        """Plot a confusion matrix heatmap.
+
+        Args:
+            targets: Ground-truth class indices.
+            predictions: Predicted class indices.
+            save_path: Optional path to save the figure.
+        """
         cm = confusion_matrix(targets, predictions)
-        
         plt.figure(figsize=(10, 8))
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                   xticklabels=Config.EMOTION_CLASSES,
-                   yticklabels=Config.EMOTION_CLASSES)
-        plt.title('Enhanced Confusion Matrix', fontsize=16, fontweight='bold')
-        plt.xlabel('Predicted Emotion')
-        plt.ylabel('Actual Emotion')
-        
+        sns.heatmap(
+            cm, annot=True, fmt='d', cmap='Blues',
+            xticklabels=Config.EMOTION_CLASSES,
+            yticklabels=Config.EMOTION_CLASSES,
+        )
+        plt.title('Confusion Matrix', fontsize=16, fontweight='bold')
+        plt.xlabel('Predicted')
+        plt.ylabel('Actual')
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
         plt.show()
 
+
 class Visualizer:
-    """Enhanced visualization utilities"""
-    
+    """Utilities for visualising training history."""
+
     @staticmethod
-    def plot_enhanced_training_history(history: Dict, save_path: Optional[Path] = None):
-        """Plot enhanced training history with multiple metrics"""
+    def plot_training_history(history: Dict, save_path: Optional[Path] = None):
+        """Plot loss, accuracy, learning rate, and validation gap curves.
+
+        Args:
+            history: Dictionary containing lists for 'epochs', 'train_loss',
+                'val_loss', 'train_acc', 'val_acc', and optionally 'learning_rates'.
+            save_path: Optional path to save the figure.
+        """
         fig, axes = plt.subplots(2, 2, figsize=(15, 10))
-        fig.suptitle('Enhanced Training History', fontsize=16, fontweight='bold')
-        
-        # Loss plot
-        axes[0, 0].plot(history['epochs'], history['train_loss'], 'b-', label='Training Loss', linewidth=2)
-        axes[0, 0].plot(history['epochs'], history['val_loss'], 'r-', label='Validation Loss', linewidth=2)
-        axes[0, 0].set_title('Loss Evolution')
+        fig.suptitle('Training History', fontsize=16, fontweight='bold')
+
+        axes[0, 0].plot(history['epochs'], history['train_loss'], 'b-', label='Train', linewidth=2)
+        axes[0, 0].plot(history['epochs'], history['val_loss'], 'r-', label='Val', linewidth=2)
+        axes[0, 0].set_title('Loss')
         axes[0, 0].set_xlabel('Epoch')
         axes[0, 0].set_ylabel('Loss')
         axes[0, 0].legend()
         axes[0, 0].grid(True, alpha=0.3)
-        
-        # Accuracy plot
-        axes[0, 1].plot(history['epochs'], history['train_acc'], 'b-', label='Training Accuracy', linewidth=2)
-        axes[0, 1].plot(history['epochs'], history['val_acc'], 'r-', label='Validation Accuracy', linewidth=2)
-        axes[0, 1].set_title('Accuracy Evolution')
+
+        axes[0, 1].plot(history['epochs'], history['train_acc'], 'b-', label='Train', linewidth=2)
+        axes[0, 1].plot(history['epochs'], history['val_acc'], 'r-', label='Val', linewidth=2)
+        axes[0, 1].set_title('Accuracy')
         axes[0, 1].set_xlabel('Epoch')
         axes[0, 1].set_ylabel('Accuracy (%)')
         axes[0, 1].legend()
         axes[0, 1].grid(True, alpha=0.3)
-        
-        # Learning rate plot
+
         if 'learning_rates' in history:
             axes[1, 0].plot(history['epochs'], history['learning_rates'], 'g-', linewidth=2)
-            axes[1, 0].set_title('Learning Rate Schedule')
+            axes[1, 0].set_title('Learning Rate')
             axes[1, 0].set_xlabel('Epoch')
-            axes[1, 0].set_ylabel('Learning Rate')
+            axes[1, 0].set_ylabel('LR')
             axes[1, 0].set_yscale('log')
             axes[1, 0].grid(True, alpha=0.3)
-        
-        # Loss difference plot
+
         if len(history['train_loss']) == len(history['val_loss']):
-            loss_diff = np.array(history['val_loss']) - np.array(history['train_loss'])
-            axes[1, 1].plot(history['epochs'], loss_diff, 'm-', linewidth=2)
-            axes[1, 1].set_title('Validation - Training Loss')
+            gap = np.array(history['val_loss']) - np.array(history['train_loss'])
+            axes[1, 1].plot(history['epochs'], gap, 'm-', linewidth=2)
+            axes[1, 1].set_title('Val − Train Loss (Generalisation Gap)')
             axes[1, 1].set_xlabel('Epoch')
             axes[1, 1].set_ylabel('Loss Difference')
             axes[1, 1].grid(True, alpha=0.3)
-        
+
         plt.tight_layout()
-        
         if save_path:
             plt.savefig(save_path, dpi=300, bbox_inches='tight')
-        
         plt.show()
 
+
 class DatabaseManager:
-    """Enhanced database management for experiments"""
-    
+    """SQLite-backed experiment tracker for training runs."""
+
     def __init__(self, db_path: Optional[Path] = None):
-        if db_path is None:
-            db_path = Config.LOGS_PATH / "experiments.db"
-        
-        self.db_path = db_path
+        """Initialise the database, creating tables if they do not exist.
+
+        Args:
+            db_path: Path to the SQLite database file. Defaults to
+                ``Config.LOGS_PATH / "experiments.db"``.
+        """
+        self.db_path = db_path or (Config.LOGS_PATH / "experiments.db")
         self._create_tables()
-    
+
     def _create_tables(self):
-        """Create enhanced experiment tracking tables"""
+        """Create experiments and metrics tables if they do not already exist."""
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
-                
-                # Experiments table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS experiments (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -396,8 +362,6 @@ class DatabaseManager:
                         notes TEXT
                     )
                 ''')
-                
-                # Metrics table
                 cursor.execute('''
                     CREATE TABLE IF NOT EXISTS metrics (
                         id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -412,10 +376,17 @@ class DatabaseManager:
                     )
                 ''')
         except Exception as e:
-            logging.warning(f"Failed to create database tables: {e}")
-    
+            logging.warning(f"Failed to initialise experiment database: {e}")
+
     def log_experiment(self, experiment_data: Dict) -> int:
-        """Log enhanced experiment data"""
+        """Insert an experiment record and return its row ID.
+
+        Args:
+            experiment_data: Dictionary with keys matching the experiments table columns.
+
+        Returns:
+            Row ID of the inserted record, or -1 on failure.
+        """
         try:
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.cursor()
@@ -435,15 +406,26 @@ class DatabaseManager:
                     experiment_data.get('best_val_loss'),
                     experiment_data.get('training_time'),
                     experiment_data.get('model_path'),
-                    experiment_data.get('notes')
+                    experiment_data.get('notes'),
                 ))
                 return cursor.lastrowid
         except Exception as e:
             logging.warning(f"Failed to log experiment: {e}")
             return -1
 
-def save_enhanced_checkpoint(model, optimizer, scheduler, epoch, loss, metrics, filepath):
-    """Save enhanced model checkpoint"""
+
+def save_checkpoint(model, optimizer, scheduler, epoch, loss, metrics, filepath):
+    """Serialise a training checkpoint to disk.
+
+    Args:
+        model: PyTorch model instance.
+        optimizer: Optimizer instance.
+        scheduler: LR scheduler instance, or None.
+        epoch: Current epoch number.
+        loss: Scalar loss value for this checkpoint.
+        metrics: Dictionary of evaluation metrics.
+        filepath: Destination path for the checkpoint file.
+    """
     checkpoint = {
         'epoch': epoch,
         'model_state_dict': model.state_dict(),
@@ -456,26 +438,33 @@ def save_enhanced_checkpoint(model, optimizer, scheduler, epoch, loss, metrics, 
             'num_classes': Config.NUM_CLASSES,
             'hidden_size': Config.HIDDEN_SIZE,
             'num_heads': Config.NUM_HEADS,
-            'dropout_rate': Config.DROPOUT_RATE
-        }
+            'dropout_rate': Config.DROPOUT_RATE,
+        },
     }
-    
     torch.save(checkpoint, filepath)
-    logging.info(f"[CHECKPOINT] Enhanced checkpoint saved: {filepath}")
+    logging.info(f"Checkpoint saved: {filepath}")
 
-def load_enhanced_checkpoint(filepath, model, optimizer=None, scheduler=None, device=Config.DEVICE):
-    """Load enhanced model checkpoint"""
+
+def load_checkpoint(filepath, model, optimizer=None, scheduler=None, device=Config.DEVICE):
+    """Load a serialised checkpoint and restore model (and optionally optimiser) state.
+
+    Args:
+        filepath: Path to the checkpoint file.
+        model: Model instance to restore weights into.
+        optimizer: Optional optimizer to restore state.
+        scheduler: Optional LR scheduler to restore state.
+        device: Device to map tensors onto.
+
+    Returns:
+        The full checkpoint dictionary.
+    """
     checkpoint = torch.load(filepath, map_location=device)
-    
     model.load_state_dict(checkpoint['model_state_dict'])
-    
+
     if optimizer and 'optimizer_state_dict' in checkpoint:
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-    
-    if scheduler and 'scheduler_state_dict' in checkpoint and checkpoint['scheduler_state_dict']:
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-    
-    return checkpoint
 
-# Initialize enhanced utilities
-logger = setup_logging()
+    if scheduler and checkpoint.get('scheduler_state_dict'):
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+
+    return checkpoint

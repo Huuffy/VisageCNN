@@ -15,24 +15,17 @@ env/
 
 # ── Dataset (large, not versioned) ────────────────────────────────────────────
 dataset/
+CK+48/
 
 # ── Model artifacts ────────────────────────────────────────────────────────────
-# Trained weights and caches are too large for git
-models/*.pth
 models/weights/
-models/*.pkl
 models/scalers/
-models/cache/train/
-models/cache/val/
+models/cache/
 models/experiments/
 checkpoints/
 
-# Keep the models/ directory itself tracked (for README references)
-!models/.gitkeep
-
 # ── Experiment tracking ────────────────────────────────────────────────────────
-logs/expressions.db
-logs/experiments.db
+*.db
 *.db-shm
 *.db-wal
 
@@ -55,6 +48,6 @@ desktop.ini
 *.tmp
 *.bak
 
-# ── Claude ─────────────────────────────────────────────
+# ── Claude ────────────────────────────────────────────────────────────────────
 /.claude
 CLAUDE.md
