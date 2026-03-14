@@ -1,0 +1,60 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+dist/
+build/
+*.egg
+
+# ── Virtual environments ───────────────────────────────────────────────────────
+venv/
+.venv/
+env/
+
+# ── Dataset (large, not versioned) ────────────────────────────────────────────
+dataset/
+
+# ── Model artifacts ────────────────────────────────────────────────────────────
+# Trained weights and caches are too large for git
+models/*.pth
+models/weights/
+models/*.pkl
+models/scalers/
+models/cache/train/
+models/cache/val/
+models/experiments/
+checkpoints/
+
+# Keep the models/ directory itself tracked (for README references)
+!models/.gitkeep
+
+# ── Experiment tracking ────────────────────────────────────────────────────────
+logs/expressions.db
+logs/experiments.db
+*.db-shm
+*.db-wal
+
+# ── Logs ──────────────────────────────────────────────────────────────────────
+logs/
+*.log
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ── Jupyter ───────────────────────────────────────────────────────────────────
+.ipynb_checkpoints/
+*.ipynb
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+*.tmp
+*.bak
+
+# ── Claude ─────────────────────────────────────────────
+/.claude
+CLAUDE.md
