@@ -15,10 +15,12 @@ os.environ["TF_CPP_MIN_LOG_LEVEL"] = "3"
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from torch.utils.data import Dataset, DataLoader, WeightedRandomSampler
 from torch.optim.lr_scheduler import OneCycleLR
 from torch.amp import autocast, GradScaler
+from torch.optim.swa_utils import AveragedModel, update_bn
 import numpy as np
 import cv2
 from tqdm import tqdm
@@ -325,7 +327,7 @@ class CachedHybridDataset(Dataset):
             # Per-class augmentation boost: minority / ambiguous classes get
             # higher augmentation diversity to compensate for fewer samples.
             # Index mapping: 0=Angry 1=Disgust 2=Fear 3=Happy 4=Neutral 5=Sad 6=Surprised
-            _AUG_BOOST = {1: 1.6, 2: 1.2, 6: 1.1}
+            _AUG_BOOST = {0: 1.4, 1: 1.6, 2: 1.4, 5: 1.2, 6: 1.1}
             boost = _AUG_BOOST.get(label, 1.0)
 
             def _p(base: float) -> float:
@@ -403,30 +405,38 @@ class FocalLoss(nn.Module):
     like Disgust (often confused with Angry).
 
     Args:
-        gamma: Focusing parameter.  0 = standard cross-entropy.  2.0 is
-            the value recommended by the original paper (Lin et al. 2017).
+        gamma: Default focusing parameter used when gamma_per_class is None.
+            0 = standard cross-entropy. 2.0 is the value recommended by the
+            original paper (Lin et al. 2017).
         alpha: Optional per-class weight tensor (same role as CrossEntropyLoss
-            ``weight``).  When supplied it additionally up-weights rare classes.
+            ``weight``). When supplied it additionally up-weights rare classes.
         label_smoothing: Label smoothing factor applied before focal weighting.
+        gamma_per_class: Optional tensor of shape [num_classes] with a
+            per-class gamma value. When provided, each sample's gamma is looked
+            up from this tensor using its ground-truth label.
     """
 
     def __init__(self, gamma: float = 2.0, alpha: torch.Tensor = None,
-                 label_smoothing: float = 0.0):
+                 label_smoothing: float = 0.0, gamma_per_class: torch.Tensor = None):
         super().__init__()
         self.gamma = gamma
         self.alpha = alpha
         self.label_smoothing = label_smoothing
+        self.gamma_per_class = gamma_per_class
 
     def forward(self, inputs: torch.Tensor, targets: torch.Tensor) -> torch.Tensor:
-        ce = torch.nn.functional.cross_entropy(
+        ce = F.cross_entropy(
             inputs, targets,
             weight=self.alpha,
             label_smoothing=self.label_smoothing,
             reduction='none',
         )
         pt = torch.exp(-ce)
-        focal = ((1.0 - pt) ** self.gamma) * ce
-        return focal.mean()
+        gamma = self.gamma_per_class[targets] if self.gamma_per_class is not None else self.gamma
+        return (((1.0 - pt) ** gamma) * ce).mean()
+
+
+_HARD_CLASSES = frozenset({0, 1, 2})  # Angry, Disgust, Fear
 
 
 def cutmix_batch(
@@ -443,18 +453,26 @@ def cutmix_batch(
     proportionally to the area ratio.  CutMix is only applied with probability
     ``prob`` so the un-augmented path stays dominant.
 
+    The effective probability is reduced when hard classes (Angry, Disgust,
+    Fear) dominate the batch, preventing CutMix from corrupting the clean
+    gradients those classes need.
+
     Args:
         coords: Coordinate tensor [B, 1434].
         crops: Face crop tensor [B, 3, H, W].
         targets: Class index tensor [B].
         alpha: Beta distribution parameter controlling cut size.
-        prob: Probability of applying CutMix to a given batch.
+        prob: Base probability of applying CutMix to a given batch.
 
     Returns:
         Tuple of (coords, crops, targets_a, targets_b, lam).
         When CutMix is not applied, targets_a == targets_b and lam == 1.0.
     """
-    if random.random() > prob:
+    hard_fraction = (targets.unsqueeze(1).eq(
+        torch.tensor(sorted(_HARD_CLASSES), device=targets.device)
+    ).any(dim=1)).float().mean().item()
+    effective_prob = prob * max(0.0, 1.0 - hard_fraction * 2.0)
+    if random.random() > effective_prob:
         return coords, crops, targets, targets, 1.0
 
     lam = float(np.random.beta(alpha, alpha))
@@ -492,9 +510,21 @@ class HybridTrainer:
         self.device = Config.DEVICE
         self.model = create_hybrid_model(pretrained_cnn=True)
 
+        self.swa_model = AveragedModel(self.model)
+        self.swa_start_epoch = 50
+        self.swa_update_freq = 3
+
+        gamma_per_class = torch.tensor(
+            [3.0, 3.5, 3.0, 1.5, 1.0, 2.5, 1.5],  # Angry, Disgust, Fear, Happy, Neutral, Sad, Surprised
+            dtype=torch.float32,
+        ).to(self.device)
         class_weights = torch.tensor(Config.CLASS_WEIGHTS, dtype=torch.float32).to(self.device)
-        self.criterion = FocalLoss(gamma=2.0, alpha=class_weights,
-                                   label_smoothing=Config.LABEL_SMOOTHING)
+        self.criterion = FocalLoss(
+            gamma=2.0,
+            alpha=class_weights,
+            label_smoothing=Config.LABEL_SMOOTHING,
+            gamma_per_class=gamma_per_class,
+        )
         self.val_criterion = nn.CrossEntropyLoss()
 
         cnn_params = list(self.model.cnn_branch.parameters())
@@ -666,6 +696,7 @@ class HybridTrainer:
         """
         self.logger.info("Initialising data loaders…")
         train_loader, val_loader, batch_size = self._create_data_loaders()
+        self.train_loader = train_loader
 
         steps_per_epoch = len(train_loader)
         total_steps = steps_per_epoch * num_epochs
@@ -701,6 +732,10 @@ class HybridTrainer:
             train_loss, train_acc = self.train_epoch(train_loader, epoch, scheduler)
             val_loss, val_acc, preds, targets, per_class = self.validate(val_loader)
 
+            if epoch >= self.swa_start_epoch and (epoch - self.swa_start_epoch) % self.swa_update_freq == 0:
+                self.swa_model.update_parameters(self.model)
+                self.logger.info(f"  SWA: averaged weights at epoch {epoch + 1}")
+
             history['train_loss'].append(train_loss)
             history['val_loss'].append(val_loss)
             history['train_acc'].append(train_acc)
@@ -716,14 +751,13 @@ class HybridTrainer:
                 status = "ok" if acc >= 80 else "low" if acc < 60 else "improving"
                 self.logger.info(f"    {emotion}: {acc:.1f}% [{status}]")
 
-            if (epoch + 1) % 10 == 0:
-                try:
-                    report = classification_report(
-                        targets, preds, target_names=Config.EMOTION_CLASSES, zero_division=0,
-                    )
-                    self.logger.info(f"\nClassification Report (epoch {epoch + 1}):\n{report}")
-                except Exception as e:
-                    self.logger.warning(f"Could not generate classification report: {e}")
+            try:
+                report = classification_report(
+                    targets, preds, target_names=Config.EMOTION_CLASSES, zero_division=0,
+                )
+                self.logger.info(f"\nClassification Report (epoch {epoch + 1}):\n{report}")
+            except Exception as e:
+                self.logger.warning(f"Could not generate classification report: {e}")
 
             if val_acc > self.best_val_acc:
                 self.best_val_acc = val_acc
@@ -748,6 +782,13 @@ class HybridTrainer:
             if self.patience_counter >= Config.EARLY_STOPPING_PATIENCE:
                 self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                 break
+
+        if hasattr(self, 'swa_model'):
+            self.logger.info("Running BN update for SWA model...")
+            update_bn(self.train_loader, self.swa_model)
+            swa_path = Config.MODELS_PATH / "weights" / "hybrid_swa_final.pth"
+            torch.save(self.swa_model.module.state_dict(), swa_path)
+            self.logger.info(f"SWA model saved: {swa_path}")
 
         with open(exp_dir / "training_history.json", 'w') as f:
             json.dump(history, f, default=str)

@@ -1,10 +1,11 @@
-"""Hybrid emotion recognition model combining EfficientNet-B0 appearance features
+"""Hybrid emotion recognition model combining EfficientNet-B2 appearance features
 with an MLP-based facial landmark coordinate encoder, fused via cross-attention.
 """
 
 import torch
 import torch.nn as nn
 import torchvision.models as models
+from torch.utils.checkpoint import checkpoint as grad_ckpt
 from typing import Optional
 import logging
 
@@ -12,10 +13,14 @@ from ..config import Config
 
 
 class FaceCropCNN(nn.Module):
-    """EfficientNet-B0 backbone for extracting appearance features from 224×224 face crops.
+    """EfficientNet-B2 backbone for extracting appearance features from 224×224 face crops.
 
-    The first three feature blocks are frozen (low-level edge/texture patterns); blocks
-    3–8 are fine-tuned to learn expression-specific appearance cues.
+    Blocks 0–1 are frozen (stem/early edges); blocks 2–8 are fine-tuned to learn
+    expression-specific appearance cues.
+
+    Per-block gradient checkpointing is applied during training: each EfficientNet
+    block is recomputed individually on the backward pass instead of storing its
+    activations. Reduces peak VRAM ~40% at ~20% compute overhead.
 
     Args:
         feature_dim: Output projection dimension. Default 256.
@@ -25,26 +30,31 @@ class FaceCropCNN(nn.Module):
     def __init__(self, feature_dim: int = 256, pretrained: bool = True):
         super().__init__()
 
-        weights = models.EfficientNet_B0_Weights.DEFAULT if pretrained else None
-        backbone = models.efficientnet_b0(weights=weights)
+        weights = models.EfficientNet_B2_Weights.DEFAULT if pretrained else None
+        backbone = models.efficientnet_b2(weights=weights)
 
         self.features = backbone.features
         self.avgpool = backbone.avgpool
 
         self.projection = nn.Sequential(
-            nn.Linear(1280, feature_dim),
+            nn.Linear(1408, feature_dim),
             nn.GELU(),
             nn.BatchNorm1d(feature_dim),
             nn.Dropout(0.4),
         )
 
         for i, layer in enumerate(self.features):
-            if i < 3:
+            if i < 2:
                 for param in layer.parameters():
                     param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Extract appearance features from a batch of face crops.
+
+        During training each EfficientNet block is individually gradient-checkpointed:
+        activations are NOT stored on the forward pass and are recomputed block-by-block
+        on the backward pass. This reduces peak VRAM by ~40% with ~20% compute overhead.
+        Inference runs without checkpointing for full speed.
 
         Args:
             x: RGB face crop tensor of shape [B, 3, 224, 224], ImageNet-normalised.
@@ -52,11 +62,15 @@ class FaceCropCNN(nn.Module):
         Returns:
             Feature tensor of shape [B, feature_dim].
         """
-        features = self.features(x)
-        features = self.avgpool(features)
-        features = features.flatten(1)
-        features = self.projection(features)
-        return features
+        if self.training:
+            for block in self.features:
+                x = grad_ckpt(block, x, use_reentrant=False, preserve_rng_state=False)
+        else:
+            x = self.features(x)
+        x = self.avgpool(x)
+        x = x.flatten(1)
+        x = self.projection(x)
+        return x
 
 
 class CoordinateBranch(nn.Module):
@@ -103,7 +117,7 @@ class HybridEmotionNet(nn.Module):
     """Hybrid model that fuses facial appearance and geometry for emotion classification.
 
     Architecture:
-        Face crop [B, 3, 224, 224]  → EfficientNet-B0 → [B, 256] appearance features
+        Face crop [B, 3, 224, 224]  → EfficientNet-B2 → [B, 256] appearance features
         Coordinates [B, 1434]       → MLP encoder     → [B, 256] geometry features
         Cross-attention → concat [B, 512] → fusion MLP → [B, num_classes]
 
@@ -111,7 +125,7 @@ class HybridEmotionNet(nn.Module):
         num_classes: Number of emotion output classes. Default 7.
         coord_dim: Dimensionality of the landmark coordinate input. Default 1434.
         feature_dim: Shared feature dimension for both branches. Default 256.
-        pretrained_cnn: Whether to use pretrained EfficientNet-B0 weights. Default True.
+        pretrained_cnn: Whether to use pretrained EfficientNet-B2 weights. Default True.
     """
 
     def __init__(self, num_classes: int = 7, coord_dim: int = 1434,
@@ -216,7 +230,7 @@ def create_hybrid_model(pretrained_cnn: bool = True) -> HybridEmotionNet:
     trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     logging.info(f"HybridEmotionNet: {total_params:,} total params, {trainable_params:,} trainable")
-    logging.info("CNN branch: EfficientNet-B0 (blocks 0-2 frozen, blocks 3-8 fine-tuned)")
+    logging.info("CNN branch: EfficientNet-B2 (blocks 0-1 frozen, blocks 2-8 fine-tuned, per-block grad checkpointing)")
     logging.info("Coordinate branch: MLP encoder (1434 -> 512 -> 384 -> 256)")
     logging.info("Fusion: bidirectional cross-attention + MLP (512 -> 384 -> 256 -> 128 -> 7)")
 
