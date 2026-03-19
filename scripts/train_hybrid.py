@@ -1,7 +1,7 @@
 """Training pipeline for HybridEmotionNet.
 
 Builds a MediaPipe face mesh cache on the first epoch, then trains the
-EfficientNet-B0 + MLP hybrid model using OneCycleLR scheduling, AMP, and
+EfficientNet-B2 + MLP hybrid model using OneCycleLR scheduling, AMP, and
 weighted random sampling.
 """
 
@@ -511,11 +511,11 @@ class HybridTrainer:
         self.model = create_hybrid_model(pretrained_cnn=True)
 
         self.swa_model = AveragedModel(self.model)
-        self.swa_start_epoch = 50
+        self.swa_start_epoch = 30
         self.swa_update_freq = 3
 
         gamma_per_class = torch.tensor(
-            [3.0, 3.5, 3.0, 1.5, 1.0, 2.5, 1.5],  # Angry, Disgust, Fear, Happy, Neutral, Sad, Surprised
+            [2.5, 3.5, 3.0, 1.0, 1.0, 2.0, 1.5],  # Angry, Disgust, Fear, Happy, Neutral, Sad, Surprised
             dtype=torch.float32,
         ).to(self.device)
         class_weights = torch.tensor(Config.CLASS_WEIGHTS, dtype=torch.float32).to(self.device)
@@ -688,11 +688,14 @@ class HybridTrainer:
 
         return total_loss / len(val_loader), 100. * correct / total, all_preds, all_targets, per_class
 
-    def train(self, num_epochs: int = 300):
+    def train(self, num_epochs: int = 300, resume_path: str = None):
         """Execute the full training loop.
 
         Args:
             num_epochs: Maximum number of training epochs.
+            resume_path: Path to a checkpoint saved by this trainer to resume
+                from. When provided, model/optimizer/scheduler state and epoch
+                counter are restored and training continues from the next epoch.
         """
         self.logger.info("Initialising data loaders…")
         train_loader, val_loader, batch_size = self._create_data_loaders()
@@ -711,6 +714,24 @@ class HybridTrainer:
             final_div_factor=100,
         )
 
+        start_epoch = 0
+        if resume_path:
+            self.logger.info(f"Resuming from {resume_path}")
+            ckpt = torch.load(resume_path, map_location=self.device)
+            self.model.load_state_dict(ckpt['model_state_dict'])
+            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if 'scheduler_state_dict' in ckpt:
+                scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            start_epoch = ckpt['epoch'] + 1
+            self.best_val_acc = ckpt.get('best_val_acc', ckpt.get('val_acc', 0.0))
+            self.patience_counter = ckpt.get('patience_counter', 0)
+            if ckpt.get('swa_model_state_dict') is not None:
+                self.swa_model.load_state_dict(ckpt['swa_model_state_dict'])
+            self.logger.info(
+                f"Resumed at epoch {start_epoch} | "
+                f"best_val={self.best_val_acc:.1f}% | patience={self.patience_counter}"
+            )
+
         self.logger.info(
             f"Training {num_epochs} epochs | batch={batch_size} | "
             f"train={len(train_loader.dataset)} | val={len(val_loader.dataset)}"
@@ -722,13 +743,15 @@ class HybridTrainer:
         )
         exp_dir.mkdir(parents=True, exist_ok=True)
 
+        latest_checkpoint_path = Config.MODELS_PATH / "weights" / "hybrid_latest.pth"
+
         history = {
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
             'per_class': [],
         }
 
-        for epoch in range(num_epochs):
+        for epoch in range(start_epoch, num_epochs):
             train_loss, train_acc = self.train_epoch(train_loader, epoch, scheduler)
             val_loss, val_acc, preds, targets, per_class = self.validate(val_loader)
 
@@ -767,8 +790,12 @@ class HybridTrainer:
                     'epoch': epoch,
                     'model_state_dict': self.model.state_dict(),
                     'optimizer_state_dict': self.optimizer.state_dict(),
+                    'scheduler_state_dict': scheduler.state_dict(),
                     'val_acc': val_acc,
+                    'best_val_acc': self.best_val_acc,
+                    'patience_counter': self.patience_counter,
                     'per_class_acc': per_class,
+                    'swa_model_state_dict': self.swa_model.state_dict(),
                     'config': {
                         'num_classes': Config.NUM_CLASSES,
                         'coordinate_dim': Config.COORDINATE_DIM,
@@ -779,13 +806,30 @@ class HybridTrainer:
             else:
                 self.patience_counter += 1
 
+            # Save latest checkpoint every epoch so training can be resumed
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': self.model.state_dict(),
+                'optimizer_state_dict': self.optimizer.state_dict(),
+                'scheduler_state_dict': scheduler.state_dict(),
+                'val_acc': val_acc,
+                'best_val_acc': self.best_val_acc,
+                'patience_counter': self.patience_counter,
+                'swa_model_state_dict': self.swa_model.state_dict(),
+            }, latest_checkpoint_path)
+
             if self.patience_counter >= Config.EARLY_STOPPING_PATIENCE:
                 self.logger.info(f"Early stopping triggered at epoch {epoch + 1}")
                 break
 
         if hasattr(self, 'swa_model'):
             self.logger.info("Running BN update for SWA model...")
-            update_bn(self.train_loader, self.swa_model)
+            self.swa_model.train()
+            with torch.no_grad():
+                for coords, crops, _ in self.train_loader:
+                    coords = coords.to(self.device)
+                    crops = crops.to(self.device)
+                    self.swa_model(coords, crops)
             swa_path = Config.MODELS_PATH / "weights" / "hybrid_swa_final.pth"
             torch.save(self.swa_model.module.state_dict(), swa_path)
             self.logger.info(f"SWA model saved: {swa_path}")
@@ -804,6 +848,10 @@ def main():
 
     parser = argparse.ArgumentParser(description='Train HybridEmotionNet')
     parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
+    parser.add_argument(
+        '--resume', type=str, default=None, metavar='CHECKPOINT',
+        help='Resume training from checkpoint (e.g. models/weights/hybrid_latest.pth)',
+    )
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -818,14 +866,15 @@ def main():
     print("=" * 60)
     print(f"Device:    {Config.DEVICE}")
     print(f"Epochs:    {args.epochs}")
-    print(f"Model:     HybridEmotionNet (EfficientNet-B0 + Coordinate MLP)")
+    print(f"Resume:    {args.resume or 'no (fresh run)'}")
+    print(f"Model:     HybridEmotionNet (EfficientNet-B2 + Coordinate MLP)")
     print(f"LR:        {0.0005} (fusion/coord) / {0.00005} (CNN)")
     print(f"Scheduler: OneCycleLR with 5% warmup")
     print(f"Classes:   {Config.EMOTION_CLASSES}")
     print("=" * 60)
 
     trainer = HybridTrainer()
-    trainer.train(num_epochs=args.epochs)
+    trainer.train(num_epochs=args.epochs, resume_path=args.resume)
 
 
 if __name__ == "__main__":
