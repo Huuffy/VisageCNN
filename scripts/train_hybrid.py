@@ -327,7 +327,7 @@ class CachedHybridDataset(Dataset):
             # Per-class augmentation boost: minority / ambiguous classes get
             # higher augmentation diversity to compensate for fewer samples.
             # Index mapping: 0=Angry 1=Disgust 2=Fear 3=Happy 4=Neutral 5=Sad 6=Surprised
-            _AUG_BOOST = {0: 1.4, 1: 1.6, 2: 1.4, 5: 1.2, 6: 1.1}
+            _AUG_BOOST = {0: 1.4, 1: 1.9, 2: 1.7, 5: 1.2, 6: 1.1}
             boost = _AUG_BOOST.get(label, 1.0)
 
             def _p(base: float) -> float:
@@ -512,6 +512,7 @@ class HybridTrainer:
 
         self.swa_model = AveragedModel(self.model)
         self.swa_start_epoch = 30
+        self.swa_end_epoch = 70
         self.swa_update_freq = 3
 
         gamma_per_class = torch.tensor(
@@ -542,6 +543,7 @@ class HybridTrainer:
         self.scaler = GradScaler('cuda') if self.use_amp else None
 
         self.best_val_acc = 0.0
+        self.best_macro_f1 = 0.0
         self.patience_counter = 0
         self.best_model_path = Config.MODELS_PATH / "weights" / "hybrid_best_model.pth"
 
@@ -644,14 +646,15 @@ class HybridTrainer:
 
         return total_loss / len(train_loader), 100. * correct / total
 
-    def validate(self, val_loader) -> Tuple[float, float, list, list, dict]:
-        """Run validation and return loss, accuracy, and per-class accuracy.
+    def validate(self, val_loader) -> Tuple[float, float, list, list, dict, dict]:
+        """Run validation and return loss, accuracy, and per-class metrics.
 
         Args:
             val_loader: Validation DataLoader.
 
         Returns:
-            Tuple of (loss, accuracy %, predictions list, targets list, per-class dict).
+            Tuple of (loss, accuracy %, predictions list, targets list,
+            per-class accuracy dict, extra metrics dict).
         """
         self.model.eval()
         total_loss, correct, total = 0.0, 0, 0
@@ -686,7 +689,32 @@ class HybridTrainer:
                 if mask.sum() > 0 else 0.0
             )
 
-        return total_loss / len(val_loader), 100. * correct / total, all_preds, all_targets, per_class
+        from sklearn.metrics import (
+            f1_score, precision_score, recall_score,
+            confusion_matrix as sk_cm,
+        )
+        t, p = np.array(all_targets), np.array(all_preds)
+        macro_f1    = float(f1_score(t, p, average='macro', zero_division=0))
+        weighted_f1 = float(f1_score(t, p, average='weighted', zero_division=0))
+        f1_per   = f1_score(t, p, average=None, zero_division=0)
+        prec_per = precision_score(t, p, average=None, zero_division=0)
+        rec_per  = recall_score(t, p, average=None, zero_division=0)
+        cm       = sk_cm(t, p).tolist()
+
+        per_class_f1   = {e: float(f1_per[i])   for i, e in enumerate(Config.EMOTION_CLASSES)}
+        per_class_prec = {e: float(prec_per[i]) for i, e in enumerate(Config.EMOTION_CLASSES)}
+        per_class_rec  = {e: float(rec_per[i])  for i, e in enumerate(Config.EMOTION_CLASSES)}
+
+        extra = {
+            'macro_f1':         macro_f1,
+            'weighted_f1':      weighted_f1,
+            'per_class_f1':     per_class_f1,
+            'per_class_prec':   per_class_prec,
+            'per_class_rec':    per_class_rec,
+            'confusion_matrix': cm,
+        }
+
+        return total_loss / len(val_loader), 100. * correct / total, all_preds, all_targets, per_class, extra
 
     def train(self, num_epochs: int = 300, resume_path: str = None):
         """Execute the full training loop.
@@ -724,6 +752,7 @@ class HybridTrainer:
                 scheduler.load_state_dict(ckpt['scheduler_state_dict'])
             start_epoch = ckpt['epoch'] + 1
             self.best_val_acc = ckpt.get('best_val_acc', ckpt.get('val_acc', 0.0))
+            self.best_macro_f1 = ckpt.get('macro_f1', 0.0)
             self.patience_counter = ckpt.get('patience_counter', 0)
             if ckpt.get('swa_model_state_dict') is not None:
                 self.swa_model.load_state_dict(ckpt['swa_model_state_dict'])
@@ -748,14 +777,19 @@ class HybridTrainer:
         history = {
             'train_loss': [], 'val_loss': [],
             'train_acc': [], 'val_acc': [],
+            'train_val_gap': [],
             'per_class': [],
+            'macro_f1': [], 'weighted_f1': [],
+            'per_class_f1': [], 'per_class_prec': [], 'per_class_rec': [],
+            'confusion_matrix': [],
         }
+        history_path = exp_dir / "training_history.json"
 
         for epoch in range(start_epoch, num_epochs):
             train_loss, train_acc = self.train_epoch(train_loader, epoch, scheduler)
-            val_loss, val_acc, preds, targets, per_class = self.validate(val_loader)
+            val_loss, val_acc, preds, targets, per_class, extra = self.validate(val_loader)
 
-            if epoch >= self.swa_start_epoch and (epoch - self.swa_start_epoch) % self.swa_update_freq == 0:
+            if self.swa_start_epoch <= epoch <= self.swa_end_epoch and (epoch - self.swa_start_epoch) % self.swa_update_freq == 0:
                 self.swa_model.update_parameters(self.model)
                 self.logger.info(f"  SWA: averaged weights at epoch {epoch + 1}")
 
@@ -763,7 +797,17 @@ class HybridTrainer:
             history['val_loss'].append(val_loss)
             history['train_acc'].append(train_acc)
             history['val_acc'].append(val_acc)
+            history['train_val_gap'].append(train_acc - val_acc)
             history['per_class'].append(per_class)
+            history['macro_f1'].append(extra['macro_f1'])
+            history['weighted_f1'].append(extra['weighted_f1'])
+            history['per_class_f1'].append(extra['per_class_f1'])
+            history['per_class_prec'].append(extra['per_class_prec'])
+            history['per_class_rec'].append(extra['per_class_rec'])
+            history['confusion_matrix'].append(extra['confusion_matrix'])
+
+            with open(history_path, 'w') as _hf:
+                json.dump(history, _hf, default=str)
 
             self.logger.info(f"Epoch {epoch + 1}/{num_epochs}")
             self.logger.info(f"  Train  loss={train_loss:.4f}  acc={train_acc:.1f}%")
@@ -782,7 +826,9 @@ class HybridTrainer:
             except Exception as e:
                 self.logger.warning(f"Could not generate classification report: {e}")
 
-            if val_acc > self.best_val_acc:
+            macro_f1 = extra['macro_f1']
+            if macro_f1 > self.best_macro_f1:
+                self.best_macro_f1 = macro_f1
                 self.best_val_acc = val_acc
                 self.patience_counter = 0
 
@@ -793,6 +839,7 @@ class HybridTrainer:
                     'scheduler_state_dict': scheduler.state_dict(),
                     'val_acc': val_acc,
                     'best_val_acc': self.best_val_acc,
+                    'macro_f1': macro_f1,
                     'patience_counter': self.patience_counter,
                     'per_class_acc': per_class,
                     'swa_model_state_dict': self.swa_model.state_dict(),
@@ -802,7 +849,7 @@ class HybridTrainer:
                     },
                 }, self.best_model_path)
 
-                self.logger.info(f"  New best: {val_acc:.1f}% → {self.best_model_path}")
+                self.logger.info(f"  New best macro F1: {macro_f1:.4f} (val={val_acc:.1f}%) → {self.best_model_path}")
             else:
                 self.patience_counter += 1
 
@@ -834,12 +881,9 @@ class HybridTrainer:
             torch.save(self.swa_model.module.state_dict(), swa_path)
             self.logger.info(f"SWA model saved: {swa_path}")
 
-        with open(exp_dir / "training_history.json", 'w') as f:
-            json.dump(history, f, default=str)
-
         print(f"\nTraining complete | Best val accuracy: {self.best_val_acc:.1f}%")
         print(f"Model saved: {self.best_model_path}")
-        print(f"History saved: {exp_dir / 'training_history.json'}")
+        print(f"History saved: {history_path}")
 
 
 def main():
@@ -847,7 +891,7 @@ def main():
     import argparse
 
     parser = argparse.ArgumentParser(description='Train HybridEmotionNet')
-    parser.add_argument('--epochs', type=int, default=300, help='Number of training epochs')
+    parser.add_argument('--epochs', type=int, default=100, help='Number of training epochs')
     parser.add_argument(
         '--resume', type=str, default=None, metavar='CHECKPOINT',
         help='Resume training from checkpoint (e.g. models/weights/hybrid_latest.pth)',

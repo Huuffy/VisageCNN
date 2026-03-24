@@ -56,7 +56,7 @@ class HybridInference:
         'Surprised': (0, 255, 255),
     }
 
-    def __init__(self, model_path: str = None):
+    def __init__(self, model_path: str = None, swa_path: str = None):
         self.device = Config.DEVICE
 
         if model_path is None:
@@ -69,6 +69,24 @@ class HybridInference:
 
         best_acc = checkpoint.get('val_acc', 'N/A')
         print(f"Hybrid model loaded | Best val acc: {best_acc}%")
+
+        # Optional SWA model for ensemble mode
+        self.swa_model = None
+        if swa_path:
+            swa_path = Path(swa_path)
+            if swa_path.exists():
+                self.swa_model = create_hybrid_model(pretrained_cnn=False)
+                swa_state = torch.load(swa_path, map_location=self.device, weights_only=False)
+                # SWA saves bare state dict (not wrapped in checkpoint dict)
+                if isinstance(swa_state, dict) and 'model_state_dict' in swa_state:
+                    swa_state = swa_state['model_state_dict']
+                if any(k.startswith('module.') for k in swa_state):
+                    swa_state = {k[len('module.'):]: v for k, v in swa_state.items()}
+                self.swa_model.load_state_dict(swa_state)
+                self.swa_model.eval()
+                print(f"SWA model loaded for ensemble | {swa_path.name}")
+            else:
+                print(f"WARNING: SWA model not found at {swa_path} — running single model")
 
         self.mp_face_mesh = mp.solutions.face_mesh
         self.face_mesh = self.mp_face_mesh.FaceMesh(
@@ -185,8 +203,14 @@ class HybridInference:
             if self.use_amp:
                 with autocast('cuda'):
                     output = self.model(coord_tensor, crop_tensor)
+                    if self.swa_model is not None:
+                        output = output + self.swa_model(coord_tensor, crop_tensor)
+                        output = output / 2.0
             else:
                 output = self.model(coord_tensor, crop_tensor)
+                if self.swa_model is not None:
+                    output = output + self.swa_model(coord_tensor, crop_tensor)
+                    output = output / 2.0
 
         probs = F.softmax(output, dim=1).cpu().numpy()[0]
 
@@ -268,10 +292,18 @@ def main():
     """Entry point — parse arguments and start live inference."""
     parser = argparse.ArgumentParser(description='VisageCNN Hybrid Model Inference')
     parser.add_argument('--camera-index', type=int, default=0)
-    parser.add_argument('--model', type=str, default=None, help='Path to model checkpoint')
+    parser.add_argument('--model', type=str, default=None, help='Path to best model checkpoint')
+    parser.add_argument('--ensemble', action='store_true',
+                        help='Average logits from best model + SWA model')
+    parser.add_argument('--swa-model', type=str, default=None,
+                        help='Path to SWA checkpoint (default: models/weights/hybrid_swa_final.pth)')
     args = parser.parse_args()
 
-    engine = HybridInference(model_path=args.model)
+    swa_path = None
+    if args.ensemble:
+        swa_path = args.swa_model or str(Config.MODELS_PATH / "weights" / "hybrid_swa_final.pth")
+
+    engine = HybridInference(model_path=args.model, swa_path=swa_path)
     engine.run(camera_index=args.camera_index)
 
 

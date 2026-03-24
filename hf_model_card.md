@@ -16,7 +16,7 @@ pipeline_tag: image-classification
 
 ![header](https://capsule-render.vercel.app/api?type=waving&color=gradient&customColorList=6,11,20&height=200&section=header&text=VisageCNN&fontSize=70&fontColor=fff&animation=fadeIn&fontAlignY=38&desc=Real-Time%20Facial%20Expression%20Recognition&descAlignY=60&descAlign=50)
 
-<a href="https://git.io/typing-svg"><img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=06B6D4&center=true&vCenter=true&width=750&lines=Hybrid+CNN+%2B+MediaPipe+Landmark+Architecture;7+Emotion+Classes+%E2%80%94+Real-Time+at+30+FPS;Bidirectional+Cross-Attention+%7C+EfficientNet-B0+%2B+478+Landmarks;Optimized+for+RTX+3050+%E2%80%94+4GB+VRAM" alt="Typing SVG" /></a>
+<a href="https://git.io/typing-svg"><img src="https://readme-typing-svg.demolab.com?font=Fira+Code&weight=600&size=22&pause=1000&color=06B6D4&center=true&vCenter=true&width=750&lines=Hybrid+CNN+%2B+MediaPipe+Landmark+Architecture;7+Emotion+Classes+%E2%80%94+Real-Time+at+30+FPS;Bidirectional+Cross-Attention+%7C+EfficientNet-B2+%2B+478+Landmarks;87.9%25+Validation+Accuracy+%7C+Disgust+92%25+Recall" alt="Typing SVG" /></a>
 
 <br/>
 
@@ -34,9 +34,11 @@ pipeline_tag: image-classification
 
 ## What Is This?
 
-**HybridEmotionNet** — a dual-branch neural network for real-time facial emotion recognition that fuses **EfficientNet-B0 appearance features** with **MediaPipe 3D landmark geometry** via bidirectional cross-attention.
+**HybridEmotionNet ** — a dual-branch neural network for real-time facial emotion recognition that fuses **EfficientNet-B2 appearance features** with **MediaPipe 3D landmark geometry** via bidirectional cross-attention.
 
-Processes webcam frames at **30+ FPS**, extracts **478 3D landmarks**, crops the face, and classifies into 7 emotions with temporal smoothing.
+Processes webcam frames at **30+ FPS**, extracts **478 3D landmarks**, crops the face at 224×224, and classifies into 7 emotions with EMA + sliding window temporal smoothing.
+
+** highlights:** 87.9% validation accuracy · Disgust recall 51%→90% · Fear recall 65%→75% · 75k balanced training images · ViT-scored quality filtering
 
 ---
 
@@ -45,9 +47,13 @@ Processes webcam frames at **30+ FPS**, extracts **478 3D landmarks**, crops the
 ![Architecture](https://huggingface.co/Huuffy/VisageCNN/resolve/main/Architecture%20digram.png)
 
 ```
-Face crop (224×224) ──► EfficientNet-B0 ──► [B, 256] appearance
+Face crop (224×224) ──► EfficientNet-B2 ──► [B, 256] appearance
+                         blocks 0-1 frozen
+                         blocks 2-8 fine-tuned
+
 478 landmarks (xyz)  ──► MLP encoder    ──► [B, 256] geometry
-                               │
+                         1434 → 512 → 384 → 256
+
                Bidirectional Cross-Attention (4 heads each)
                ┌──────────────────────────────────────────┐
                │  coord → CNN  (geometry queries appear.) │
@@ -61,11 +67,31 @@ Face crop (224×224) ──► EfficientNet-B0 ──► [B, 256] appearance
 
 | Component | Detail |
 |-----------|--------|
-| CNN branch | EfficientNet-B0, ImageNet init, blocks 0–2 frozen |
+| CNN branch | EfficientNet-B2, ImageNet init, blocks 0–1 frozen, gradient checkpointing |
 | Coord branch | MLP 1434 → 512 → 384 → 256, BN + Dropout |
 | Fusion | Bidirectional cross-attention + MLP |
-| Parameters | 6.2M total / 5.75M trainable |
-| Model size | 72 MB |
+| Parameters | ~8M total |
+| Model size | ~90 MB |
+
+---
+
+## Performance 
+
+| Metric | Value |
+|--------|-------|
+| Validation accuracy | **87.9%** |
+| Macro F1 | **0.88** |
+| Inference speed | ~12 ms/frame on RTX 3050 |
+
+| Emotion | Precision | Recall | F1 |
+|---------|-----------|--------|----|
+| Angry | 0.85 | 0.83 | 0.84 |
+| Disgust | 0.97 | 0.90 | 0.94 |
+| Fear | 0.89 | 0.75 | 0.82 |
+| Happy | 0.97 | 0.99 | 0.98 |
+| Neutral | 0.85 | 0.91 | 0.88 |
+| Sad | 0.78 | 0.88 | 0.83 |
+| Surprised | 0.83 | 0.90 | 0.86 |
 
 ---
 
@@ -73,9 +99,9 @@ Face crop (224×224) ──► EfficientNet-B0 ──► [B, 256] appearance
 
 | File | Size | Required |
 |------|------|---------|
-| `models/weights/hybrid_best_model.pth` | 72 MB | Yes — model weights |
+| `models/weights/hybrid_best_model.pth` | ~90 MB | Yes — best macro F1 checkpoint |
+| `models/weights/hybrid_swa_final.pth` | ~90 MB | Optional — SWA ensemble model |
 | `models/scalers/hybrid_coordinate_scaler.pkl` | 18 KB | Yes — landmark scaler |
-| `Architecture digram.png` | — | No — docs only |
 
 ---
 
@@ -99,6 +125,7 @@ import shutil, pathlib
 
 for remote, local in [
     ("models/weights/hybrid_best_model.pth",        "models/weights/hybrid_best_model.pth"),
+    ("models/weights/hybrid_swa_final.pth",         "models/weights/hybrid_swa_final.pth"),
     ("models/scalers/hybrid_coordinate_scaler.pkl", "models/scalers/hybrid_coordinate_scaler.pkl"),
 ]:
     src = hf_hub_download(repo_id="Huuffy/VisageCNN", filename=remote)
@@ -108,14 +135,19 @@ for remote, local in [
 
 Or with the HF CLI:
 ```bash
-hf download Huuffy/VisageCNN models/weights/hybrid_best_model.pth --local-dir .
-hf download Huuffy/VisageCNN models/scalers/hybrid_coordinate_scaler.pkl --local-dir .
+huggingface-cli download Huuffy/VisageCNN models/weights/hybrid_best_model.pth --local-dir .
+huggingface-cli download Huuffy/VisageCNN models/weights/hybrid_swa_final.pth --local-dir .
+huggingface-cli download Huuffy/VisageCNN models/scalers/hybrid_coordinate_scaler.pkl --local-dir .
 ```
 
 ### 3 — Run inference
 
 ```bash
+# Standard
 python inference/run_hybrid.py
+
+# With SWA ensemble
+python inference/run_hybrid.py --ensemble
 ```
 
 Press **Q** to quit.
@@ -136,21 +168,17 @@ Press **Q** to quit.
 
 ---
 
-## Training Dataset
+## Training Dataset 
 
-~30k clean images — FER2013 noise removed across all classes:
+75,376 total images — 10,768 per class × 7 emotions, perfectly balanced.
 
-| Class | Images | Sources |
-|-------|--------|---------|
-| Angry | 6,130 | RAF-DB + AffectNet + AffectNet-Short + CK+ |
-| Surprised | 5,212 | RAF-DB + AffectNet |
-| Sad | 4,941 | RAF-DB + AffectNet + AffectNet-Short + CK+ |
-| Disgust | 3,782 | AffectNet-Short + RAF-DB + CK+ |
-| Neutral | 3,475 | RAF-DB + AffectNet |
-| Fear | 3,418 | AffectNet-Short + RAF-DB + CK+ |
-| Happy | 3,124 | RAF-DB + AffectNet |
+**Sources:** AffectNet · RAF-DB · FER2013 · AffectNet-Short · ScullyowesHenry · RAF-DB Kaggle
 
-Max class imbalance: **1.97×**
+All images passed a two-stage quality filter:
+1. MediaPipe FaceMesh (dual confidence: 0.5 normal + 0.2 lenient for extreme expressions)
+2. ViT confidence scoring (`dima806/facial_emotions_image_detection`) with per-class asymmetric mislabel thresholds
+
+Final class balance achieved via ViT-scored capping — lowest-confidence images removed first, preserving the highest quality examples per class.
 
 ---
 
@@ -161,26 +189,24 @@ Max class imbalance: **1.97×**
 | Loss | Focal Loss γ=2.0 + label smoothing 0.12 |
 | Optimizer | AdamW, weight decay 0.05 |
 | LR | OneCycleLR — CNN 5e-5, fusion 5e-4 |
-| Batch | 128 + grad accumulation ×2 (eff. 256) |
+| Batch | 96 + grad accumulation ×2 (eff. 192) |
 | Augmentation | CutMix + noise + rotation + zoom |
 | Mixed precision | torch.amp (AMP) |
-| Early stopping | patience=40 on val accuracy |
+| Best model saved by | Macro F1 (not val accuracy) |
+| SWA | Epochs 30–70, BN update after training |
+| Early stopping | patience=15 on macro F1 |
 
 ---
 
 ## Retrain From Scratch
 
 ```bash
-# Build dataset (downloads ~30k clean images from HuggingFace)
-pip install datasets
-python scripts/prepare_dataset.py
-
 # Delete old cache and train
 rmdir /s /q models\cache
 python scripts/train_hybrid.py
 ```
 
-Full training guide: [GitHub README](https://github.com/Huuffy/VisageCNN)
+Full guide: [GitHub README](https://github.com/Huuffy/VisageCNN)
 
 ---
 

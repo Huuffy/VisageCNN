@@ -48,7 +48,20 @@ desktop.ini
 # ── Misc ──────────────────────────────────────────────────────────────────────
 *.tmp
 *.bak
+temp_balanced/
+dataset_preparation.log
 
 # ── Claude ────────────────────────────────────────────────────────────────────
 /.claude
 CLAUDE.md
+
+# ── Data pipeline scripts (local use only, not needed to run the model) ───────
+scripts/download_disgust.py
+scripts/filter_dataset.py
+scripts/balance_dataset.py
+scripts/cap_dataset.py
+scripts/dedup_quality.py
+scripts/prepare_data.py
+scripts/prepare_dataset.py
+scripts/train_hybrid.py
+scripts/train.py
