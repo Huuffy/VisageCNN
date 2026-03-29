@@ -50,10 +50,12 @@ desktop.ini
 *.bak
 temp_balanced/
 dataset_preparation.log
+node_modules/
 
-# ── Claude ────────────────────────────────────────────────────────────────────
+# ── AI ────────────────────────────────────────────────────────────────────
 /.claude
 CLAUDE.md
+/.agent
 
 # ── Data pipeline scripts (local use only, not needed to run the model) ───────
 scripts/download_disgust.py

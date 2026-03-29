@@ -244,17 +244,71 @@ models/scalers/hybrid_coordinate_scaler.pkl
 ## Real-Time Inference
 
 ```bash
-# Hybrid model — recommended
+# Standard — opens camera selector then live HUD
 python inference/run_hybrid.py
 
-# With SWA ensemble (slightly smoother, ~same accuracy)
+# With SWA ensemble (averages best + SWA checkpoint)
 python inference/run_hybrid.py --ensemble
 
-# With a specific checkpoint
+# Skip camera selector, use camera 0 directly
+python inference/run_hybrid.py --camera-index 0
+
+# Cap frame rate
+python inference/run_hybrid.py --max-fps 30
+
+# Custom checkpoint
 python inference/run_hybrid.py --model models/weights/hybrid_best_model.pth
 ```
 
-Press **Q** to quit.
+### Three-screen experience
+
+**Screen 0 — Loading splash**
+
+Shows hardware detection, model loading status and scaler status with tick indicators before anything else opens. If a required file is missing, the exact download command is shown.
+
+```
+VISAGECNN
+Hybrid Emotion Recognition · Loading
+──────────────────────────────────────
+ OK   CUDA · RTX 3050 (4 GB VRAM)
+ OK   Model loaded · hybrid_best_model.pth (90 MB) · best val 87.9%
+ OK   Coordinate scaler loaded
+ OK   Ready! Opening camera selector...
+```
+
+**Screen 1 — Camera selector**
+
+Probes camera indices 0–3, shows a live thumbnail for each detected camera side by side. Press the number key (`0`, `1`, `2` …) to select. Skipped automatically if `--camera-index N` is passed.
+
+**Screen 2 — Live HUD (1280 × 720)**
+
+```
+┌────────────────────────────┬──────────────────────────────┐
+│                            │  VISAGECNN          FPS 28.4 │
+│   Webcam feed (640×480)    ├──────────────────────────────┤
+│                            │  HAPPY                       │
+│  ┌──────────────────────┐  │  98.2%   Excellent           │
+│  │  L-corner face box   │  ├──────────────────────────────┤
+│  │  + emotion chip      │  │  Angry   [██░░░░░░░░]   8%   │
+│  └──────────────────────┘  │  Disgust [█░░░░░░░░░]   3%   │
+│                            │  Fear    [█░░░░░░░░░]   2%   │
+│                            │  Happy   [██████████]  98%   │
+│                            │  Neutral [█░░░░░░░░░]   4%   │
+│                            │  Sad     [░░░░░░░░░░]   1%   │
+│                            │  Surprise[░░░░░░░░░░]   1%   │
+│                            ├──────────────────────────────┤
+│                            │  ■■■■■■■■■■■■ history strip  │
+│                            ├──────────────────────────────┤
+│ C capture · L landmarks    │  GPU · 12.4 ms               │
+│ Q quit                     │  HybridEmotionNet · B2+lm    │
+└────────────────────────────┴──────────────────────────────┘
+```
+
+| Key | Action |
+|-----|--------|
+| `Q` / `Esc` | Quit |
+| `C` | Save annotated 1280×720 frame to `captures/<timestamp>.png` |
+| `L` | Toggle 478 MediaPipe landmark dots overlay |
 
 ---
 
